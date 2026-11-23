@@ -62,19 +62,6 @@ func NumCPU() int {
 	return 1
 }
 
-func addTimer(tim *timerNode) {
-	runtimePanic(errTimersUnsupported)
-}
-
-func reAddTimer(tn *timerNode) {
-	runtimePanic(errTimersUnsupported)
-}
-
-func removeTimer(tim *timer) *timerNode {
-	runtimePanic(errTimersUnsupported)
-	return nil
-}
-
 func schedulerRunQueue() *task.Queue {
 	// This function is not actually used, it is only called when hasScheduler
 	// is true.

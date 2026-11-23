@@ -134,6 +134,12 @@ func (c *Config) GOMIPS() string {
 	return c.Options.GOMIPS
 }
 
+// InertGoroutines reports whether go statements start nothing when there is
+// no scheduler, instead of being rejected. See internal/task.
+func (c *Config) InertGoroutines() bool {
+	return slices.Contains(c.BuildTags(), "goroutines.inert")
+}
+
 // BuildTags returns the complete list of build tags used during this build.
 func (c *Config) BuildTags() []string {
 	tags := append([]string(nil), c.Target.BuildTags...) // copy slice (avoid a race)

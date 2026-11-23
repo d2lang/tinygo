@@ -187,7 +187,7 @@ func Optimize(mod llvm.Module, config *compileopts.Config) []error {
 		}
 	}
 
-	if config.Scheduler() == "none" {
+	if config.Scheduler() == "none" && !config.InertGoroutines() {
 		// Check only after temporary ABI roots have been removed and dead code
 		// eliminated. Otherwise, a dead function kept alive solely to prevent
 		// argument promotion can produce a spurious scheduler error.

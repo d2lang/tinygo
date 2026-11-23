@@ -2,8 +2,6 @@
 
 package task
 
-import "unsafe"
-
 // There is only one goroutine so the task struct can be a global.
 var mainTask Task
 
@@ -24,12 +22,6 @@ func NumGoroutine() int {
 }
 
 func CoroExit(next *Task) {
-	runtimePanicSchedulerDisabled()
-}
-
-//go:noinline
-func start(fn uintptr, args unsafe.Pointer, stackSize uintptr) {
-	// The compiler will error if this is reachable.
 	runtimePanicSchedulerDisabled()
 }
 
