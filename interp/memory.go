@@ -102,6 +102,10 @@ func (mv *memoryView) revert() {
 	}
 }
 
+// unwindSignalName is the flag that return-based panic unwinding sets while a
+// panic travels up the stack. See runtime.unwindPending.
+const unwindSignalName = "runtime.unwindPendingSignal"
+
 // markExternalLoad marks the given LLVM value as having an external read. That
 // means that the interpreter can still read from it, but cannot write to it as
 // that would mean the external read (done at runtime) reads from a state that
@@ -131,6 +135,15 @@ func (mv *memoryView) markExternal(llvmValue llvm.Value, mark uint8) error {
 	}
 
 	if !llvmValue.IsAGlobalValue().IsNil() {
+		if llvmValue.Name() == unwindSignalName {
+			// Every function that checks for a pending unwind refers to this
+			// flag, so a package initializer that has to run at runtime would
+			// mark it as written and every later initializer, which checks it
+			// too, would have to run at runtime as well. The flag is only set
+			// while the stack unwinds: whenever an initializer runs forward,
+			// which is all that is evaluated here, it is clear.
+			return nil
+		}
 		objectIndex := mv.r.getValue(llvmValue).(pointerValue).index()
 		obj := mv.get(objectIndex)
 		if obj.marked < mark {
