@@ -1,0 +1,171 @@
+name: D2 release
+
+# Builds the compiler tarballs that D2's CI and developers install. Pushing a
+# tag like v0.44.0-d2.1 publishes them as a GitHub release; a manual run only
+# builds them (and fills the LLVM cache, which tag builds can then read
+# because this branch is the repository's default).
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*-d2.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-amd64:
+    # Statically linked, built in Alpine like upstream's release.
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.27-alpine
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Install apk dependencies
+        run: apk add tar git openssh make g++ mold
+      - name: Work around CVE-2022-24765
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+      - name: Extract TinyGo version
+        id: version
+        run: ./.github/workflows/tinygo-extract-version.sh | tee -a "$GITHUB_OUTPUT"
+      - name: Cache Go
+        uses: actions/cache@v5
+        with:
+          key: go-cache-linux-alpine-v2-${{ hashFiles('go.mod') }}
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+      - name: Restore LLVM source cache
+        uses: actions/cache/restore@v5
+        id: cache-llvm-source
+        with:
+          key: llvm-source-22-linux-alpine-v1-${{ hashFiles('llvm-version.txt') }}
+          path: |
+            llvm-project/clang/lib/Headers
+            llvm-project/clang/include
+            llvm-project/compiler-rt
+            llvm-project/lld/include
+            llvm-project/llvm/include
+      - name: Download LLVM source
+        if: steps.cache-llvm-source.outputs.cache-hit != 'true'
+        run: make llvm-source
+      - name: Save LLVM source cache
+        uses: actions/cache/save@v5
+        if: steps.cache-llvm-source.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.cache-llvm-source.outputs.cache-primary-key }}
+          path: |
+            llvm-project/clang/lib/Headers
+            llvm-project/clang/include
+            llvm-project/compiler-rt
+            llvm-project/lld/include
+            llvm-project/llvm/include
+      - name: Restore LLVM build cache
+        uses: actions/cache/restore@v5
+        id: cache-llvm-build
+        with:
+          key: llvm-build-22-linux-alpine-v1-${{ hashFiles('llvm-version.txt') }}
+          path: llvm-build
+      - name: Build LLVM
+        if: steps.cache-llvm-build.outputs.cache-hit != 'true'
+        run: |
+          rm -rf llvm-project
+          make llvm-source
+          apk add cmake samurai python3
+          make llvm-build
+          # Remove unnecessary object files (to reduce cache size).
+          find llvm-build -name CMakeFiles -prune -exec rm -r '{}' \;
+      - name: Save LLVM build cache
+        uses: actions/cache/save@v5
+        if: steps.cache-llvm-build.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.cache-llvm-build.outputs.cache-primary-key }}
+          path: llvm-build
+      - name: Get Binaryen revision
+        id: binaryen-revision
+        run: echo "revision=$(git rev-parse HEAD:lib/binaryen)" >> "$GITHUB_OUTPUT"
+      - name: Cache Binaryen
+        uses: actions/cache@v5
+        id: cache-binaryen
+        with:
+          key: binaryen-linux-alpine-v4-${{ steps.binaryen-revision.outputs.revision }}
+          path: build/wasm-opt
+      - name: Build Binaryen
+        if: steps.cache-binaryen.outputs.cache-hit != 'true'
+        run: |
+          apk add cmake samurai python3
+          make binaryen STATIC=1
+      - name: Build TinyGo release
+        run: |
+          make release -j3 STATIC=1
+          cp -p build/release.tar.gz tinygo${{ steps.version.outputs.version }}.linux-amd64.tar.gz
+      - name: Upload tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: tinygo${{ steps.version.outputs.version }}.linux-amd64.tar.gz
+          path: tinygo${{ steps.version.outputs.version }}.linux-amd64.tar.gz
+          archive: false
+
+  darwin-arm64:
+    runs-on: macos-15
+    steps:
+      - name: Install Dependencies
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install binaryen
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+      - name: Extract TinyGo version
+        id: version
+        run: ./.github/workflows/tinygo-extract-version.sh | tee -a "$GITHUB_OUTPUT"
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.1'
+          cache: true
+      - uses: ./.github/actions/setup-llvm-macos
+        with:
+          os: macos-15
+      - name: make gen-device
+        run: make -j3 gen-device
+      - name: Build TinyGo release tarball
+        run: |
+          make release -j3
+          cp -p build/release.tar.gz tinygo${{ steps.version.outputs.version }}.darwin-arm64.tar.gz
+      - name: Upload tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: tinygo${{ steps.version.outputs.version }}.darwin-arm64.tar.gz
+          path: tinygo${{ steps.version.outputs.version }}.darwin-arm64.tar.gz
+          archive: false
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux-amd64, darwin-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download tarballs
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum tinygo*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "TinyGo $GITHUB_REF_NAME" \
+            --notes "TinyGo ${{ needs.linux-amd64.outputs.version }} as D2 builds its WebAssembly module with it. See README-D2.md on the d2 branch for what differs from upstream." \
+            tinygo*.tar.gz SHA256SUMS
