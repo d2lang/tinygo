@@ -11,7 +11,7 @@ computes, D2 returns. So it is now built without a scheduler and with panics
 unwound by checks the compiler emits after calls:
 
     tinygo build -target=wasm -scheduler=none -panic-unwind=explicit \
-      -buildmode=c-shared -tags=goroutines.inert -stack-size=1MB -no-debug ./d2js
+      -buildmode=c-shared -tags=goroutines.inert -stack-size=4MB -no-debug ./d2js
 
 What that needed here:
 
@@ -26,6 +26,23 @@ What that needed here:
   goroutines (a clock for regular-expression timeouts, for one) that could not
   run during a synchronous call under a cooperative scheduler either. Waiting
   for such a goroutine deadlocks.
+
+Since then, for size and correctness:
+
+- The flag that tells callers a panic is unwinding is a WebAssembly global
+  instead of a word in memory, which makes each of the checks smaller.
+- Stack objects for the collector are no longer linked into a chain: on
+  WebAssembly the collector scans the stack itself and never walked it.
+- A call from JavaScript that traps (a stack overflow, say) gives its stack
+  back, so the next call works; and waiting on a channel or lock with no
+  goroutine to wake it is a fatal deadlock instead of a hang.
+- The table of global roots stores a run of equally spaced ranges (the
+  strings of a table, say) as one entry instead of one per element.
+- Two kinds of pointers were not roots and could be freed while in use: a
+  value read from a map, and a global that LLVM retyped to an integer because
+  it is only ever copied whole. `-tags=gc.stress` builds a collector that
+  makes such bugs show: it collects at every allocation and poisons what it
+  frees.
 
 Releases are tagged `v<upstream version>-d2.<n>` and built by
 `.github/workflows/d2-release.yml`.
