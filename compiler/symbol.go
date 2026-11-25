@@ -895,6 +895,18 @@ func (c *compilerContext) getGlobal(g *ssa.Global) llvm.Value {
 	if llvmGlobal.IsNil() {
 		typ := g.Type().(*types.Pointer).Elem()
 		llvmType := c.getLLVMType(typ)
+		if info.linkName == unwindSignalName && c.unwindSignalIsWasmGlobal() {
+			// LLVM's WebAssembly backend turns variables in address space 1
+			// into WebAssembly globals. See runtime.unwindPendingSignal.
+			llvmGlobal = llvm.AddGlobalInAddressSpace(c.mod, llvmType, info.linkName, wasmGlobalAddressSpace)
+			// The backend can only read and write such a variable as a
+			// whole word, and reads anything narrower from linear memory at
+			// a bogus address instead. LLVM would narrow this one to a
+			// single bit, because it only ever holds 0 or 1. Listing the
+			// variable as used keeps LLVM from changing what it looks like.
+			llvmutil.AppendToGlobal(c.mod, "llvm.compiler.used", llvmGlobal)
+			return llvmGlobal
+		}
 		llvmGlobal = llvm.AddGlobal(c.mod, llvmType, info.linkName)
 
 		// Set alignment from the //go:align comment.
@@ -925,6 +937,20 @@ func (c *compilerContext) getGlobal(g *ssa.Global) llvm.Value {
 		}
 	}
 	return llvmGlobal
+}
+
+// unwindSignalName is the flag that return-based panic unwinding sets while a
+// panic travels up the stack.
+const unwindSignalName = "runtime.unwindPendingSignal"
+
+// wasmGlobalAddressSpace is the address space of WebAssembly globals in LLVM.
+const wasmGlobalAddressSpace = 1
+
+// unwindSignalIsWasmGlobal reports whether the unwind flag is a WebAssembly
+// global. The runtime declares it as a whole word for exactly these builds.
+func (c *compilerContext) unwindSignalIsWasmGlobal() bool {
+	return c.PanicUnwind == "explicit" && c.archFamily() == "wasm32" &&
+		c.Scheduler != "cores" && c.Scheduler != "threads"
 }
 
 // getGlobalInfo returns some information about a specific global.

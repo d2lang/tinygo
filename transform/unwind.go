@@ -10,11 +10,11 @@ import "tinygo.org/x/go-llvm"
 // calls that do not modify the signal.
 func AddUnwindAssumptions(mod llvm.Module) bool {
 	signal := mod.NamedGlobal("runtime.unwindPendingSignal")
-	if signal.IsNil() ||
-		signal.GlobalValueType().TypeKind() != llvm.IntegerTypeKind ||
-		signal.GlobalValueType().IntTypeWidth() != 1 {
+	// The flag is a bool in memory, or a word in a WebAssembly global.
+	if signal.IsNil() || signal.GlobalValueType().TypeKind() != llvm.IntegerTypeKind {
 		return false
 	}
+	signalType := signal.GlobalValueType()
 	unwind := mod.NamedFunction("runtime.unwindPending")
 	if unwind.IsNil() {
 		return false
@@ -45,8 +45,8 @@ func AddUnwindAssumptions(mod llvm.Module) bool {
 	for fn := range functions {
 		first := fn.EntryBasicBlock().FirstInstruction()
 		builder.SetInsertPointBefore(first)
-		unwinding := builder.CreateLoad(ctx.Int1Type(), signal, "unwind.entry")
-		notUnwinding := builder.CreateNot(unwinding, "")
+		unwinding := builder.CreateLoad(signalType, signal, "unwind.entry")
+		notUnwinding := builder.CreateICmp(llvm.IntEQ, unwinding, llvm.ConstNull(signalType), "")
 		builder.CreateCall(assumeType, assume, []llvm.Value{notUnwinding}, "")
 	}
 	return true
