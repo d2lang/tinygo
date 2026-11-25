@@ -435,3 +435,117 @@ define i32 @stackWithoutPointers(i32 %x) {
   %c = add i32 %a, %b
   ret i32 %c
 }
+
+declare void @takesInteger(i32)
+
+; LLVM copies two pointers as one i64. With the variable they were copied to
+; gone, that integer is all that has them during the call.
+define i32 @integerCopy(ptr %from) {
+  %both = load i64, ptr %from
+  call void @collect()
+  %low = trunc i64 %both to i32
+  %p = inttoptr i32 %low to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; The integer is never a pointer here: it goes back to memory as it is.
+define void @integerCopyStored(ptr %from, ptr %to) {
+  %both = load i64, ptr %from
+  call void @collect()
+  store i64 %both, ptr %to
+  ret void
+}
+
+; The half that is used is taken before the call. The slot is that of the
+; load: it is rooted where it is made.
+define i32 @integerCopyHalf(ptr %from) {
+  %both = load i64, ptr %from
+  %shifted = lshr i64 %both, 32
+  %high = trunc i64 %shifted to i32
+  call void @collect()
+  %p = inttoptr i32 %high to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; An address can be computed from the integer without an inttoptr.
+define i32 @integerAddress(ptr %from) {
+  %n = load i32, ptr %from
+  call void @collect()
+  %p = getelementptr i8, ptr null, i32 %n
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; What an address is computed from is a pointer, however it is computed.
+define i32 @integerSum(ptr %from) {
+  %n = load i32, ptr %from
+  %next = add i32 %n, 4
+  call void @collect()
+  %p = inttoptr i32 %next to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; An integer that is passed on or returned after the call may be a pointer to
+; whoever gets it.
+define i32 @integerPassedOn(ptr %from) {
+  %n = load i32, ptr %from
+  %m = call i32 @leaf(ptr %from)
+  call void @collect()
+  call void @takesInteger(i32 %n)
+  ret i32 %m
+}
+
+; An integer that is only calculated with or compared is not a pointer for
+; anybody, and neither is one that is passed on before anything collects.
+define i32 @integerNotDelivered(ptr %from) {
+  %n = load i32, ptr %from
+  %m = load i32, ptr %from
+  call void @takesInteger(i32 %m)
+  call void @collect()
+  %sum = add i32 %n, 1
+  %big = icmp ugt i32 %n, 10
+  %r = select i1 %big, i32 %sum, i32 0
+  ret i32 %r
+}
+
+; An integer that is carried round a loop outlives the slot of the load.
+define void @integerLoop(ptr %from, ptr %to, i1 %repeat) {
+entry:
+  br label %loop
+
+loop:
+  %previous = phi i32 [ 0, %entry ], [ %current, %loop ]
+  %current = load i32, ptr %from
+  call void @collect()
+  store i32 %previous, ptr %to
+  br i1 %repeat, label %loop, label %end
+
+end:
+  ret void
+}
+
+; A stack variable that gets half of such an integer has to stay in memory.
+define i32 @integerOnStack(ptr %from) {
+  %variable = alloca i32
+  %both = load i64, ptr %from
+  %low = trunc i64 %both to i32
+  store i32 %low, ptr %variable
+  call void @collect()
+  %v = call i32 @leaf(ptr %variable)
+  ret i32 %v
+}
+
+; Where the pass cannot follow what happens it keeps every such integer that
+; is delivered, as it keeps every tracked pointer.
+define i32 @integerCopyReturnsTwice(ptr %from, ptr %buf) {
+  %both = load i64, ptr %from
+  %again = call i32 @setjmp(ptr %buf)
+  call void @collect()
+  %low = trunc i64 %both to i32
+  %p = inttoptr i32 %low to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}

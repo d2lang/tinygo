@@ -414,6 +414,20 @@ const (
 // produces: all the places where a pointer into the heap can enter the
 // function. Each is rooted where it is made.
 //
+// A pointer does not have to look like one. LLVM copies a small object (one or
+// two pointers, a string, an interface) as an integer of its size, and once
+// the variable it was copied to is gone that integer is the only thing that
+// has the pointers. So every integer of at least the size of a pointer that
+// a load or a call produces is taken for a possible pointer, along with what
+// the instructions that keep its bits together make of it, and whatever an
+// address is computed from is one for sure (carrier). Such an integer gets
+// a slot, as the integer it is (the collector reads the stack word by word),
+// if it is in use across a collecting call and that use delivers its bits:
+// makes an address of them, stores them, passes them to a call or returns
+// them. Comparing it or calculating with it does not. Passing it to the
+// collecting call itself does not count either: a function takes the
+// integers it is given for integers.
+//
 // The pass runs before link time optimization, and it is the final code that
 // has to obey the rule, not the code seen here. Stores and calls keep their
 // order, so a pointer with a slot is in its slot before the call. What must
@@ -426,7 +440,8 @@ const (
 //   - A new allocation that gets no slot is passed to exposeStackObjectName,
 //     like a stack object.
 //   - So is a stack variable that may hold such a pointer when a collection
-//     runs. It then stays in memory, where the collector finds it.
+//     runs, as a pointer or as such an integer. It then stays in memory,
+//     where the collector finds it.
 //   - Globals with pointers have their address in the table of global roots.
 //   - No call stays marked 'tail' in a function that exposes part of its
 //     stack: LLVM takes such a call to leave the caller's stack alone.
@@ -462,9 +477,23 @@ type gcSlotFunc struct {
 	// says that a pointer may sit in it as an integer. fromHere says that the
 	// pointer was not handed to the function by its caller: a load or a call
 	// made it, or it is computed from the result of one.
+	//
+	// carrier says that the value is an integer, or has one in it, that may be
+	// a pointer nobody declared: LLVM copies a small object (a pointer or two,
+	// a string, an interface) as an integer of its size, and that integer is
+	// all that is left of the copy once the variable it went to is gone. Any
+	// integer of at least the size of a pointer that a load or a call
+	// produces is taken for one, and so is what the instructions that keep
+	// its bits make of it (see carrierOperands). Whatever an inttoptr is
+	// computed from is one for sure. delivers says that the bits of a carrier
+	// get somewhere a pointer can be used from or found again: an inttoptr,
+	// memory, a call or the caller. A carrier that is only compared or
+	// calculated with is never a pointer for anybody.
 	hasPointer []bool
 	intBits    []bool
 	fromHere   []bool
+	carrier    []bool
+	delivers   []bool
 
 	// boundary marks the values at which the search for uses stops.
 	boundary []bool
@@ -487,6 +516,7 @@ type gcSlot struct {
 	def   int32      // index of value, or -1
 	agg   int32      // index of the aggregate that value is a field of, or -1
 	path  []uint32   // which field
+	ints  bool       // the field is an integer
 }
 
 func (p *gcSlotPass) newSlotFunc(fn llvm.Value) *gcSlotFunc {
@@ -670,7 +700,163 @@ func (p *gcSlotPass) newSlotFunc(fn llvm.Value) *gcSlotFunc {
 		}
 	}
 
+	f.findCarriers()
 	return f
+}
+
+// canCarry returns whether a value of this type has room for a pointer in an
+// integer.
+func (f *gcSlotFunc) canCarry(typ llvm.Type) bool {
+	switch typ.TypeKind() {
+	case llvm.IntegerTypeKind:
+		return typ.IntTypeWidth() >= f.pass.targetData.PointerSize()*8
+	case llvm.StructTypeKind:
+		for _, field := range typ.StructElementTypes() {
+			if f.canCarry(field) {
+				return true
+			}
+		}
+	case llvm.ArrayTypeKind:
+		return typ.ArrayLength() != 0 && f.canCarry(typ.ElementType())
+	}
+	return false
+}
+
+// carrierOperands returns which operands (a range of indices into f.ops) an
+// instruction takes the bits of its result from, if it is one that keeps the
+// bits of an integer together: a pointer that goes in can be read from what
+// comes out. Arithmetic is not: nothing makes a sum from a copied pointer.
+func (f *gcSlotFunc) carrierOperands(i int32) (from, to int32) {
+	from, to = f.opStart[i], f.opStart[i+1]
+	switch f.opcode[i] {
+	case llvm.Trunc, llvm.ZExt, llvm.SExt, llvm.BitCast, opFreeze, llvm.Or, llvm.And,
+		llvm.PHI, llvm.InsertValue, llvm.ExtractValue:
+		return from, to
+	case llvm.Shl, llvm.LShr, llvm.AShr:
+		// Not the distance.
+		return from, from + 1
+	case llvm.Select:
+		return from + 1, to
+	case llvm.Call:
+		// A rotation is how LLVM swaps the halves of an integer.
+		if f.kind[i] == slotFlow {
+			name := f.insts[i].CalledValue().Name()
+			if strings.HasPrefix(name, "llvm.fshl.") || strings.HasPrefix(name, "llvm.fshr.") {
+				return from, from + 2
+			}
+		}
+	}
+	return from, from
+}
+
+// findCarriers finds the integers that may be a pointer without having been
+// made from one in this function (carrier), and those among them that are
+// put where a pointer can be taken from again (delivers).
+func (f *gcSlotFunc) findCarriers() {
+	n := int32(len(f.insts))
+	f.carrier = make([]bool, n)
+	f.delivers = make([]bool, n)
+
+	// What an address is computed from: through any calculation, back to
+	// where the integers come from.
+	f.stack = f.stack[:0]
+	mark := func(value int32) {
+		if value >= 0 && !f.carrier[value] && f.insts[value].Type().TypeKind() != llvm.PointerTypeKind {
+			f.carrier[value] = true
+			f.stack = append(f.stack, value)
+		}
+	}
+	for i := int32(0); i < n; i++ {
+		if f.opcode[i] == llvm.IntToPtr || f.isIntegerAddress(i) {
+			for slot := f.opStart[i]; slot < f.opStart[i+1]; slot++ {
+				mark(f.ops[slot])
+			}
+		}
+	}
+	for len(f.stack) != 0 {
+		value := f.stack[len(f.stack)-1]
+		f.stack = f.stack[:len(f.stack)-1]
+		if f.kind[value] != slotFlow {
+			continue
+		}
+		for slot := f.opStart[value]; slot < f.opStart[value+1]; slot++ {
+			if !f.isCallee(slot) {
+				mark(f.ops[slot])
+			}
+		}
+	}
+
+	// What memory and calls hand out, and what keeps its bits.
+	for i := int32(0); i < n; i++ {
+		if f.kind[i] == slotOrigin && f.canCarry(f.insts[i].Type()) {
+			f.carrier[i] = true
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for i := int32(0); i < n; i++ {
+			if f.carrier[i] || f.kind[i] != slotFlow {
+				continue
+			}
+			from, to := f.carrierOperands(i)
+			for slot := from; slot < to; slot++ {
+				if operand := f.ops[slot]; operand >= 0 && f.carrier[operand] {
+					if f.canCarry(f.insts[i].Type()) {
+						f.carrier[i] = true
+						changed = true
+					}
+					break
+				}
+			}
+		}
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for i := n - 1; i >= 0; i-- {
+			if !f.carrier[i] || f.delivers[i] {
+				continue
+			}
+			for u := f.useStart[i]; u < f.useStart[i+1]; u++ {
+				if f.deliversTo(f.opInst[f.uses[u]]) {
+					f.delivers[i] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+}
+
+// isIntegerAddress returns whether the instruction computes an address from
+// integers alone, the other way to write an inttoptr.
+func (f *gcSlotFunc) isIntegerAddress(i int32) bool {
+	return f.opcode[i] == llvm.GetElementPtr && f.insts[i].Operand(0).IsNull()
+}
+
+// deliversTo returns whether user, given a carrier, puts its bits where a
+// pointer can be used from or found again.
+func (f *gcSlotFunc) deliversTo(user int32) bool {
+	switch f.opcode[user] {
+	case llvm.IntToPtr, llvm.Store, llvm.Ret:
+		return true
+	case llvm.GetElementPtr:
+		return f.isIntegerAddress(user)
+	}
+	switch f.kind[user] {
+	case slotOrigin:
+		// An argument of a call, or the new value of an atomic operation.
+		return true
+	case slotFlow:
+		return f.carrier[user] && f.delivers[user]
+	}
+	return false
+}
+
+// carriesInt is carries for a carrier: whether the bits of operand can end up
+// in user.
+func (f *gcSlotFunc) carriesInt(operand, user int32) bool {
+	return f.kind[user] == slotFlow && f.carrier[operand] && f.carrier[user]
 }
 
 // blocksInCycles returns which blocks lie on a cycle, see blockInCycle.
@@ -764,7 +950,9 @@ func (f *gcSlotFunc) isCallee(slot int32) bool {
 
 // liveAtCollection returns whether value is in use when a collecting call is
 // made or when it returns, looking only at the uses that skip does not reject.
-func (f *gcSlotFunc) liveAtCollection(value int32, skip func(user int32) bool) bool {
+// With ints set it asks this for value as a carrier: only the uses that
+// deliver its bits count.
+func (f *gcSlotFunc) liveAtCollection(value int32, skip func(user int32) bool, ints bool) bool {
 	f.stampID++
 	f.stack = f.stack[:0]
 	defBlock := f.blockOf[value]
@@ -792,7 +980,11 @@ func (f *gcSlotFunc) liveAtCollection(value int32, skip func(user int32) bool) b
 		if skip != nil && skip(user) {
 			continue
 		}
-		if f.opcode[user] == llvm.ExtractValue && !f.hasPointer[user] && !f.intBits[user] {
+		if ints {
+			if !f.deliversTo(user) {
+				continue
+			}
+		} else if f.opcode[user] == llvm.ExtractValue && !f.hasPointer[user] && !f.intBits[user] {
 			// This takes a field without a pointer out of an aggregate.
 			continue
 		}
@@ -803,7 +995,10 @@ func (f *gcSlotFunc) liveAtCollection(value int32, skip func(user int32) bool) b
 			}
 			continue
 		}
-		if f.collecting[user] && !f.isCallee(slot) {
+		if f.collecting[user] && !f.isCallee(slot) && !ints {
+			// The callee does not root its parameters. That goes for
+			// pointers: an integer that a function is given is an integer
+			// to it, so one that is passed on is delivered by then.
 			return true
 		}
 		block := f.blockOf[user]
@@ -891,6 +1086,28 @@ func (f *gcSlotFunc) source(ptr llvm.Value) (def, agg int32, path []uint32) {
 	}
 }
 
+// carrierPaths appends the index path of every integer in a value of type typ
+// that has room for a pointer.
+func (f *gcSlotFunc) carrierPaths(typ llvm.Type, prefix []uint32, paths [][]uint32) [][]uint32 {
+	switch typ.TypeKind() {
+	case llvm.IntegerTypeKind:
+		if f.canCarry(typ) {
+			paths = append(paths, append([]uint32(nil), prefix...))
+		}
+	case llvm.StructTypeKind:
+		for i, field := range typ.StructElementTypes() {
+			paths = f.carrierPaths(field, append(prefix, uint32(i)), paths)
+		}
+	case llvm.ArrayTypeKind:
+		if f.canCarry(typ.ElementType()) {
+			for i := 0; i < typ.ArrayLength(); i++ {
+				paths = f.carrierPaths(typ.ElementType(), append(prefix, uint32(i)), paths)
+			}
+		}
+	}
+	return paths
+}
+
 // pathsOverlap returns whether one field contains the other.
 func pathsOverlap(a, b []uint32) bool {
 	for i := 0; i < len(a) && i < len(b); i++ {
@@ -927,13 +1144,30 @@ func pointerPaths(typ llvm.Type, prefix []uint32, paths [][]uint32) [][]uint32 {
 func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 	f.findVariables()
 	if f.conservative {
+		// Every tracked pointer, and every integer that may be a pointer
+		// and is delivered somewhere.
+		for i, inst := range f.insts {
+			if !f.delivers[i] || f.kind[i] != slotOrigin && f.opcode[i] != llvm.PHI {
+				continue
+			}
+			typ := inst.Type()
+			if typ.TypeKind() == llvm.IntegerTypeKind {
+				if f.canCarry(typ) {
+					tracked = append(tracked, inst)
+				}
+				continue
+			}
+			for _, path := range f.carrierPaths(typ, nil, nil) {
+				tracked = append(tracked, f.extractField(int32(i), path))
+			}
+		}
 		return tracked
 	}
 
 	var slots []gcSlot
 	isSlot := make([]bool, len(f.insts))
 	isField := map[string]struct{}{}
-	addSlot := func(def, agg int32, path []uint32) {
+	addSlot := func(def, agg int32, path []uint32, ints bool) {
 		switch {
 		case def >= 0:
 			if isSlot[def] {
@@ -954,14 +1188,16 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 				return
 			}
 			isField[key] = struct{}{}
-			slots = append(slots, gcSlot{def: -1, agg: agg, path: path})
+			slots = append(slots, gcSlot{def: -1, agg: agg, path: path, ints: ints})
 		}
 	}
 	for _, ptr := range tracked {
-		addSlot(f.source(ptr))
+		def, agg, path := f.source(ptr)
+		addSlot(def, agg, path, false)
 	}
 	for i, inst := range f.insts {
-		if !f.hasPointer[i] {
+		ints := f.carrier[i] || f.intBits[i]
+		if !f.hasPointer[i] && !ints {
 			continue
 		}
 		switch {
@@ -974,12 +1210,25 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 			continue
 		}
 		typ := inst.Type()
-		if typ.TypeKind() == llvm.PointerTypeKind {
-			addSlot(int32(i), -1, nil)
+		switch typ.TypeKind() {
+		case llvm.PointerTypeKind:
+			addSlot(int32(i), -1, nil, false)
+			continue
+		case llvm.IntegerTypeKind:
+			// The slot takes the integer as it is: the collector reads
+			// the stack word by word.
+			if f.canCarry(typ) {
+				addSlot(int32(i), -1, nil, true)
+			}
 			continue
 		}
 		for _, path := range pointerPaths(typ, nil, nil) {
-			addSlot(-1, int32(i), path)
+			addSlot(-1, int32(i), path, false)
+		}
+		if ints {
+			for _, path := range f.carrierPaths(typ, nil, nil) {
+				addSlot(-1, int32(i), path, true)
+			}
 		}
 		if f.opcode[i] == llvm.PHI {
 			f.boundary[i] = true
@@ -988,12 +1237,20 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 
 	// needed[v] says that v, or something computed from v up to the next
 	// value with a slot of its own, is in use at a collecting call.
+	//
+	// neededInt[v] says that for a carrier: v, or something that has its bits,
+	// is at a collecting call on its way to where it is delivered.
 	needed := make([]bool, len(f.insts))
-	var worklist []int32
+	neededInt := make([]bool, len(f.insts))
+	var worklist, worklistInt []int32
 	for i := range f.insts {
-		if (f.hasPointer[i] || f.intBits[i]) && f.liveAtCollection(int32(i), nil) {
+		if (f.hasPointer[i] || f.intBits[i]) && f.liveAtCollection(int32(i), nil, false) {
 			needed[i] = true
 			worklist = append(worklist, int32(i))
+		}
+		if f.delivers[i] && f.liveAtCollection(int32(i), nil, true) {
+			neededInt[i] = true
+			worklistInt = append(worklistInt, int32(i))
 		}
 	}
 	for len(worklist) != 0 {
@@ -1002,11 +1259,33 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 		if f.boundary[user] {
 			continue
 		}
+		integerAddress := f.isIntegerAddress(user)
 		for slot := f.opStart[user]; slot < f.opStart[user+1]; slot++ {
 			operand := f.ops[slot]
-			if operand >= 0 && !needed[operand] && f.carries(operand, user) && !f.isCallee(slot) {
+			if operand < 0 {
+				continue
+			}
+			if !needed[operand] && f.carries(operand, user) && !f.isCallee(slot) {
 				needed[operand] = true
 				worklist = append(worklist, operand)
+			}
+			if integerAddress && !neededInt[operand] && f.carrier[operand] {
+				neededInt[operand] = true
+				worklistInt = append(worklistInt, operand)
+			}
+		}
+	}
+	for len(worklistInt) != 0 {
+		user := worklistInt[len(worklistInt)-1]
+		worklistInt = worklistInt[:len(worklistInt)-1]
+		if f.boundary[user] {
+			continue
+		}
+		for slot := f.opStart[user]; slot < f.opStart[user+1]; slot++ {
+			operand := f.ops[slot]
+			if operand >= 0 && !neededInt[operand] && f.carriesInt(operand, user) && !f.isCallee(slot) {
+				neededInt[operand] = true
+				worklistInt = append(worklistInt, operand)
 			}
 		}
 	}
@@ -1027,27 +1306,41 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 			return !pathsOverlap(userPath, path)
 		}
 	}
-	fieldNeeded := func(agg int32, path []uint32) bool {
+	fieldNeeded := func(agg int32, path []uint32, ints bool) bool {
 		skip := otherField(agg, path)
+		// An integer field is looked at as a carrier, and like a pointer if
+		// it may have been made from one.
+		asPointer := !ints || f.intBits[agg]
+		asCarrier := ints && f.carrier[agg]
 		for u := f.useStart[agg]; u < f.useStart[agg+1]; u++ {
 			user := f.opInst[f.uses[u]]
-			if needed[user] && !f.boundary[user] && f.carries(agg, user) && !skip(user) {
+			if f.boundary[user] || skip(user) {
+				continue
+			}
+			if asPointer && needed[user] && f.carries(agg, user) {
+				return true
+			}
+			if asCarrier && neededInt[user] && f.carriesInt(agg, user) {
 				return true
 			}
 		}
-		return f.liveAtCollection(agg, skip)
+		return asPointer && f.liveAtCollection(agg, skip, false) ||
+			asCarrier && f.liveAtCollection(agg, skip, true)
 	}
 
 	var live []llvm.Value
 	for _, slot := range slots {
 		switch {
 		case slot.def >= 0:
-			if needed[slot.def] {
+			if needed[slot.def] || neededInt[slot.def] {
 				live = append(live, slot.value)
 			}
-		case fieldNeeded(slot.agg, slot.path):
+		case fieldNeeded(slot.agg, slot.path, slot.ints):
 			live = append(live, f.extractField(slot.agg, slot.path))
 		}
+	}
+	if GCSlotCheck != nil {
+		f.checkCarriers(live)
 	}
 	return live
 }
@@ -1316,7 +1609,7 @@ func (f *gcSlotFunc) mayBePointer(value llvm.Value) bool {
 	case llvm.Load, opAtomicRMW, opAtomicCmpXchg, llvm.VAArg:
 		return true
 	}
-	return f.conservative || f.intBits[idx]
+	return f.conservative || f.intBits[idx] || f.carrier[idx]
 }
 
 // exposeStackObjectName is the function that every function with a stack
