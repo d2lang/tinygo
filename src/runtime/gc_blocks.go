@@ -287,6 +287,15 @@ func popFreeRange(len uintptr) unsafe.Pointer {
 		remDst = &(*remDst).nextLen
 	}
 
+	if gcStress {
+		// Take from the longest range instead of the shortest that fits, so
+		// that blocks which were just freed (and poisoned) are reused as late
+		// as possible.
+		for *remDst != nil && (*remDst).nextLen != nil {
+			remDst = &(*remDst).nextLen
+		}
+	}
+
 	rangeWithLength := *remDst
 	if rangeWithLength == nil {
 		// No ranges are long enough.
@@ -438,6 +447,13 @@ func alloc(size uintptr, layout unsafe.Pointer) unsafe.Pointer {
 	// Update the total allocation counters.
 	gcTotalAlloc += uint64(rawSize)
 	gcMallocs++
+
+	if gcStress && gcStressDue() {
+		// Collect before the allocation, however much memory is free: an
+		// object that nothing roots is then lost at the first allocation
+		// after its last root went away. See gc_blocks_stress.go.
+		runGC()
+	}
 
 	// Acquire a range of free blocks.
 	var ranGC bool
@@ -605,6 +621,10 @@ func runGC() (freeBytes uintptr) {
 		println("running collection cycle...")
 	}
 
+	if gcStress {
+		gcStressBeforeMark()
+	}
+
 	// Mark phase: mark all reachable objects, recursively.
 	gcMarkReachable()
 
@@ -745,6 +765,9 @@ func markRoot(addr, root uintptr) {
 	// Find the heap block corresponding to the root.
 	if !isOnHeap(root) {
 		// This is not a heap pointer.
+		if gcStress && root == gcStressPoison {
+			gcStressPoisonFound(addr)
+		}
 		return
 	}
 	block := blockFromAddr(root)
@@ -788,6 +811,9 @@ func sweep() uintptr {
 		freeEnd := block
 		for block > 0 && (block-1).state() != blockStateMark {
 			block--
+			if gcStress && block.state() != blockStateFree {
+				gcStressPoisonBlock(block)
+			}
 			block.free()
 		}
 
