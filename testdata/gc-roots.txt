@@ -1,0 +1,24 @@
+across a call ok
+as an argument ok
+interior pointer ok
+slice to the end ok
+carried round a loop ok
+map lookup ok
+interface value ok
+closure ok
+bound method ok
+deferred call ok
+deferred calls in a loop ok
+recovered panic ok
+unsafe arithmetic ok
+strings and bytes ok
+appended ok
+two results ok
+channel ok
+type switch ok
+array on the stack ok
+filled by a callee ok
+struct by value ok
+linked list ok
+selected ok
+range over a map lookup ok

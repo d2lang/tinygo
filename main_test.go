@@ -722,6 +722,7 @@ func TestBuild(t *testing.T) {
 
 			runPlatTests(optionsFromTarget("wasm", sema), tests, t)
 			runGCLivenessTest(optionsFromTarget("wasm", sema), t)
+			runGCRootsTest(optionsFromTarget("wasm", sema), t)
 			// Test with -gc=boehm.
 			t.Run("gc.go-boehm", func(t *testing.T) {
 				t.Parallel()
@@ -1081,6 +1082,30 @@ func runGCLivenessTest(options compileopts.Options, t *testing.T) {
 		t.Parallel()
 		runTest("gc-liveness-repro.go", options, t, nil, nil)
 	})
+}
+
+// runGCRootsTest runs the programs that lose an object if the compiler does
+// not root a pointer, with the collector that makes a lost object show
+// (-tags=gc.stress), with and without a scheduler.
+func runGCRootsTest(options compileopts.Options, t *testing.T) {
+	t.Run("gc-roots.go", func(t *testing.T) {
+		t.Parallel()
+		runTest("gc-roots.go", options, t, nil, nil)
+	})
+	for _, name := range []string{"gc-roots.go", "gc-liveness-repro.go", "gc.go"} {
+		for _, scheduler := range []string{"asyncify", "none"} {
+			t.Run(name+"-gc-stress-scheduler-"+scheduler, func(t *testing.T) {
+				t.Parallel()
+				options := compileopts.Options(options)
+				options.Tags = append(append([]string(nil), options.Tags...), "gc.stress")
+				options.Scheduler = scheduler
+				if scheduler == "none" {
+					options.PanicUnwind = "explicit"
+				}
+				runTest(name, options, t, nil, nil)
+			})
+		}
+	}
 }
 
 func runTest(name string, options compileopts.Options, t *testing.T, cmdArgs, environmentVars []string) {

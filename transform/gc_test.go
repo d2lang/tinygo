@@ -15,6 +15,15 @@ func TestMakeGCStackSlots(t *testing.T) {
 	})
 }
 
+// TestGCSlotLiveness checks which pointers get a stack slot, which do not, and
+// what is exposed instead.
+func TestGCSlotLiveness(t *testing.T) {
+	t.Parallel()
+	testTransform(t, "testdata/gc-slotliveness", func(mod llvm.Module) {
+		transform.MakeGCStackSlots(mod)
+	})
+}
+
 func TestMakeGCGlobalRootsAVR(t *testing.T) {
 	t.Parallel()
 	testTransform(t, "testdata/gc-globals-avr", func(mod llvm.Module) {
