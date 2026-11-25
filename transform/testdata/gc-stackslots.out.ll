@@ -39,30 +39,22 @@ define ptr @getPointer() {
 }
 
 define ptr @needsStackSlots() {
-  %gc.stackobject = alloca { ptr }, align 8
-  store { ptr } zeroinitializer, ptr %gc.stackobject, align 4
-  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
   %ptr = call ptr @runtime.alloc(i32 4, ptr inttoptr (i32 3 to ptr))
-  %1 = getelementptr { ptr }, ptr %gc.stackobject, i32 0, i32 0
-  store ptr %ptr, ptr %1, align 4
+  call void @tinygo_exposeStackObject(ptr %ptr)
   call void @someArbitraryFunction()
   %val = load i8, ptr @someGlobal, align 1
   ret ptr %ptr
 }
 
 define ptr @needsStackSlots2() {
-  %gc.stackobject = alloca { ptr, ptr, ptr }, align 8
-  store { ptr, ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
+  %gc.stackobject = alloca { ptr }, align 8
+  store { ptr } zeroinitializer, ptr %gc.stackobject, align 4
   call void @tinygo_exposeStackObject(ptr %gc.stackobject)
   %ptr1 = call ptr @getPointer()
-  %1 = getelementptr { ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
+  %1 = getelementptr { ptr }, ptr %gc.stackobject, i32 0, i32 0
   store ptr %ptr1, ptr %1, align 4
   %ptr2 = getelementptr i8, ptr @someGlobal, i32 0
-  %2 = getelementptr { ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
-  store ptr %ptr2, ptr %2, align 4
   %unused = call ptr @runtime.alloc(i32 4, ptr inttoptr (i32 3 to ptr))
-  %3 = getelementptr { ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 2
-  store ptr %unused, ptr %3, align 4
   ret ptr %ptr1
 }
 
@@ -72,43 +64,36 @@ define ptr @noAllocatingFunction() {
 }
 
 define ptr @fibNext(ptr %x, ptr %y) {
-  %gc.stackobject = alloca { ptr }, align 8
-  store { ptr } zeroinitializer, ptr %gc.stackobject, align 4
-  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
   %x.val = load i8, ptr %x, align 1
   %y.val = load i8, ptr %y, align 1
   %out.val = add i8 %x.val, %y.val
   %out.alloc = call ptr @runtime.alloc(i32 1, ptr inttoptr (i32 3 to ptr))
-  %1 = getelementptr { ptr }, ptr %gc.stackobject, i32 0, i32 0
-  store ptr %out.alloc, ptr %1, align 4
+  call void @tinygo_exposeStackObject(ptr %out.alloc)
   store i8 %out.val, ptr %out.alloc, align 1
   ret ptr %out.alloc
 }
 
 define ptr @allocLoop() {
 entry:
-  %gc.stackobject = alloca { ptr, ptr, ptr, ptr, ptr }, align 8
-  store { ptr, ptr, ptr, ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
+  %gc.stackobject = alloca { ptr, ptr, ptr }, align 8
+  store { ptr, ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
   call void @tinygo_exposeStackObject(ptr %gc.stackobject)
   %entry.x = call ptr @runtime.alloc(i32 1, ptr inttoptr (i32 3 to ptr))
-  %0 = getelementptr { ptr, ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
+  %0 = getelementptr { ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
   store ptr %entry.x, ptr %0, align 4
   %entry.y = call ptr @runtime.alloc(i32 1, ptr inttoptr (i32 3 to ptr))
-  %1 = getelementptr { ptr, ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
-  store ptr %entry.y, ptr %1, align 4
+  call void @tinygo_exposeStackObject(ptr %entry.y)
   store i8 1, ptr %entry.y, align 1
   br label %loop
 
 loop:                                             ; preds = %loop, %entry
   %prev.y = phi ptr [ %entry.y, %entry ], [ %prev.x, %loop ]
   %prev.x = phi ptr [ %entry.x, %entry ], [ %next.x, %loop ]
-  %2 = getelementptr { ptr, ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 3
-  store ptr %prev.y, ptr %2, align 4
-  %3 = getelementptr { ptr, ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 2
-  store ptr %prev.x, ptr %3, align 4
+  %1 = getelementptr { ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 2
+  store ptr %prev.y, ptr %1, align 4
+  %2 = getelementptr { ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
+  store ptr %prev.x, ptr %2, align 4
   %next.x = call ptr @fibNext(ptr %prev.x, ptr %prev.y)
-  %4 = getelementptr { ptr, ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 4
-  store ptr %next.x, ptr %4, align 4
   %next.x.val = load i8, ptr %next.x, align 1
   %loop.done = icmp ult i8 40, %next.x.val
   br i1 %loop.done, label %end, label %loop
@@ -119,21 +104,19 @@ end:                                              ; preds = %loop
 
 define ptr @loopPhiUntrackedInput(i1 %repeat) {
 entry:
-  %gc.stackobject = alloca { ptr, ptr, ptr }, align 8
-  store { ptr, ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
+  %gc.stackobject = alloca { ptr }, align 8
+  store { ptr } zeroinitializer, ptr %gc.stackobject, align 4
   call void @tinygo_exposeStackObject(ptr %gc.stackobject)
   %loop.entry = call ptr @runtime.alloc(i32 4, ptr inttoptr (i32 3 to ptr))
-  %0 = getelementptr { ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
-  store ptr %loop.entry, ptr %0, align 4
+  call void @tinygo_exposeStackObject(ptr %loop.entry)
   br label %loop
 
 loop:                                             ; preds = %loop, %entry
   %loop.cur = phi ptr [ %loop.entry, %entry ], [ %loop.next, %loop ]
-  %1 = getelementptr { ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
-  store ptr %loop.cur, ptr %1, align 4
+  %0 = getelementptr { ptr }, ptr %gc.stackobject, i32 0, i32 0
+  store ptr %loop.cur, ptr %0, align 4
   %loop.next = call ptr @runtime.alloc(i32 4, ptr inttoptr (i32 3 to ptr))
-  %2 = getelementptr { ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 2
-  store ptr %loop.next, ptr %2, align 4
+  call void @tinygo_exposeStackObject(ptr %loop.next)
   br i1 %repeat, label %loop, label %end
 
 end:                                              ; preds = %loop
@@ -142,27 +125,24 @@ end:                                              ; preds = %loop
 
 define ptr @nestedLoopPhiUntrackedInput(i1 %repeat.inner, i1 %repeat.outer) {
 entry:
-  %gc.stackobject = alloca { ptr, ptr, ptr, ptr }, align 8
-  store { ptr, ptr, ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
+  %gc.stackobject = alloca { ptr, ptr }, align 8
+  store { ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
   call void @tinygo_exposeStackObject(ptr %gc.stackobject)
   %original = call ptr @runtime.alloc(i32 4, ptr inttoptr (i32 3 to ptr))
-  %0 = getelementptr { ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 3
+  %0 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
   store ptr %original, ptr %0, align 4
   br label %outer
 
 outer:                                            ; preds = %latch, %entry
   %outer.ptr = phi ptr [ %original, %entry ], [ %inner.ptr, %latch ]
-  %1 = getelementptr { ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
-  store ptr %outer.ptr, ptr %1, align 4
   br label %inner
 
 inner:                                            ; preds = %inner, %outer
   %inner.ptr = phi ptr [ %outer.ptr, %outer ], [ %next, %inner ]
-  %2 = getelementptr { ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
-  store ptr %inner.ptr, ptr %2, align 4
+  %1 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
+  store ptr %inner.ptr, ptr %1, align 4
   %next = call ptr @runtime.alloc(i32 4, ptr inttoptr (i32 3 to ptr))
-  %3 = getelementptr { ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 2
-  store ptr %next, ptr %3, align 4
+  call void @tinygo_exposeStackObject(ptr %next)
   br i1 %repeat.inner, label %inner, label %latch
 
 latch:                                            ; preds = %inner
@@ -195,27 +175,22 @@ join:                                             ; preds = %right, %left
 
 define ptr @duplicateNestedLoopPhis(i1 %repeat.inner, i1 %repeat.outer) {
 entry:
-  %gc.stackobject = alloca { ptr, ptr, ptr, ptr }, align 8
-  store { ptr, ptr, ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
+  %gc.stackobject = alloca { ptr }, align 8
+  store { ptr } zeroinitializer, ptr %gc.stackobject, align 4
   call void @tinygo_exposeStackObject(ptr %gc.stackobject)
   %original = call ptr @getPointer()
-  %0 = getelementptr { ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
-  store ptr %original, ptr %0, align 4
   br label %outer
 
 outer:                                            ; preds = %latch, %entry
   %outer.ptr = phi ptr [ %original, %entry ], [ %inner.ptr, %latch ]
-  %1 = getelementptr { ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
-  store ptr %outer.ptr, ptr %1, align 4
   br label %inner
 
 inner:                                            ; preds = %inner, %outer
   %inner.ptr = phi ptr [ %outer.ptr, %outer ], [ %next, %inner ]
-  %2 = getelementptr { ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 2
-  store ptr %inner.ptr, ptr %2, align 4
+  %0 = getelementptr { ptr }, ptr %gc.stackobject, i32 0, i32 0
+  store ptr %inner.ptr, ptr %0, align 4
   %next = call ptr @runtime.alloc(i32 4, ptr inttoptr (i32 3 to ptr))
-  %3 = getelementptr { ptr, ptr, ptr, ptr }, ptr %gc.stackobject, i32 0, i32 3
-  store ptr %next, ptr %3, align 4
+  call void @tinygo_exposeStackObject(ptr %next)
   br i1 %repeat.inner, label %inner, label %latch
 
 latch:                                            ; preds = %inner
@@ -251,16 +226,9 @@ join:                                             ; preds = %right, %left
 declare ptr @arrayAlloc()
 
 define void @testGEPBitcast() {
-  %gc.stackobject = alloca { ptr, ptr }, align 8
-  store { ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
-  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
   %arr = call ptr @arrayAlloc()
   %arr.bitcast = getelementptr [32 x i8], ptr %arr, i32 0, i32 0
-  %1 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
-  store ptr %arr.bitcast, ptr %1, align 4
   %other = call ptr @runtime.alloc(i32 1, ptr inttoptr (i32 3 to ptr))
-  %2 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
-  store ptr %other, ptr %2, align 4
   ret void
 }
 
@@ -280,12 +248,8 @@ define void @earlyPopRegression() {
 }
 
 define void @allocAndSave(ptr %x) {
-  %gc.stackobject = alloca { ptr }, align 8
-  store { ptr } zeroinitializer, ptr %gc.stackobject, align 4
-  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
   %y = call ptr @runtime.alloc(i32 4, ptr inttoptr (i32 3 to ptr))
-  %1 = getelementptr { ptr }, ptr %gc.stackobject, i32 0, i32 0
-  store ptr %y, ptr %1, align 4
+  call void @tinygo_exposeStackObject(ptr %y)
   store ptr %y, ptr %x, align 4
   store ptr %x, ptr @ptrGlobal, align 4
   ret void
