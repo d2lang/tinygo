@@ -19,16 +19,9 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 	// Check whether there are allocations at all.
 	alloc := mod.NamedFunction("runtime.alloc")
 	if alloc.IsNil() {
-		// Nothing to. Make sure all remaining bits and pieces for stack
-		// chains are neutralized.
+		// Nothing to do. Without allocations there is nothing to track.
 		for _, call := range getUses(mod.NamedFunction("runtime.trackPointer")) {
 			call.EraseFromParentAsInstruction()
-		}
-		stackChainStart := mod.NamedGlobal("runtime.stackChainStart")
-		if !stackChainStart.IsNil() {
-			stackChainStart.SetLinkage(llvm.InternalLinkage)
-			stackChainStart.SetInitializer(llvm.ConstNull(stackChainStart.GlobalValueType()))
-			stackChainStart.SetGlobalConstant(true)
 		}
 		return hasGlobalRoots
 	}
@@ -41,9 +34,6 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 	ctx := mod.Context()
 	builder := ctx.NewBuilder()
 	defer builder.Dispose()
-	targetData := llvm.NewTargetData(mod.DataLayout())
-	defer targetData.Dispose()
-	uintptrType := ctx.IntType(targetData.PointerSize() * 8)
 
 	// All functions that call runtime.alloc needs stack objects.
 	trackFuncs := map[llvm.Value]struct{}{}
@@ -102,20 +92,18 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 		}
 	}
 
-	// Collect some variables used below in the loop.
-	stackChainStart := mod.NamedGlobal("runtime.stackChainStart")
-	if stackChainStart.IsNil() {
-		// This may be reached in a weird scenario where we call runtime.alloc but the garbage collector is unreachable.
-		// This can be accomplished by allocating 0 bytes.
-		// There is no point in tracking anything.
-		for _, use := range getUses(trackPointer) {
-			use.EraseFromParentAsInstruction()
-		}
-		return hasGlobalRoots
+	// The garbage collector finds the stack objects by reading the stack,
+	// which LLVM knows nothing about: it would drop every store to a stack
+	// object, as nothing that it can see reads one. So each function hands its
+	// stack object to a function that LLVM cannot look into and that, for all
+	// LLVM knows, keeps the address for whatever is called next. In truth it
+	// does nothing, see asm_tinygowasm.S.
+	ptrType := llvm.PointerType(ctx.Int8Type(), 0)
+	exposeType := llvm.FunctionType(ctx.VoidType(), []llvm.Type{ptrType}, false)
+	expose := mod.NamedFunction(exposeStackObjectName)
+	if expose.IsNil() {
+		expose = llvm.AddFunction(mod, exposeStackObjectName, exposeType)
 	}
-	stackChainStart.SetLinkage(llvm.InternalLinkage)
-	stackChainStartType := stackChainStart.GlobalValueType()
-	stackChainStart.SetInitializer(llvm.ConstNull(stackChainStartType))
 
 	// Iterate until runtime.trackPointer has no uses left.
 	for use := trackPointer.FirstUse(); !use.IsNil(); use = trackPointer.FirstUse() {
@@ -276,36 +264,20 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 			continue
 		}
 
-		// Determine the type of the required stack slot.
-		fields := []llvm.Type{
-			stackChainStartType, // Pointer to parent frame.
-			uintptrType,         // Number of elements in this frame.
-		}
-		for _, ptr := range pointers {
-			fields = append(fields, ptr.Type())
+		// The stack object has a slot for every pointer.
+		fields := make([]llvm.Type, len(pointers))
+		for i, ptr := range pointers {
+			fields[i] = ptr.Type()
 		}
 		stackObjectType := ctx.StructType(fields, false)
 
-		// Create the stack object at the function entry.
+		// Create the stack object at the function entry, with nothing in it.
 		builder.SetInsertPointBefore(fn.EntryBasicBlock().FirstInstruction())
 		stackObject := builder.CreateAlloca(stackObjectType, "gc.stackobject")
-		initialStackObject := llvm.ConstNull(stackObjectType)
-		numSlots := (targetData.TypeAllocSize(stackObjectType) - uint64(targetData.PointerSize())*2) / uint64(targetData.ABITypeAlignment(uintptrType))
-		numSlotsValue := llvm.ConstInt(uintptrType, numSlots, false)
-		initialStackObject = builder.CreateInsertValue(initialStackObject, numSlotsValue, 1, "")
-		builder.CreateStore(initialStackObject, stackObject)
-
-		// Update stack start.
-		parent := builder.CreateLoad(stackChainStartType, stackChainStart, "")
-		gep := builder.CreateGEP(stackObjectType, stackObject, []llvm.Value{
-			llvm.ConstInt(ctx.Int32Type(), 0, false),
-			llvm.ConstInt(ctx.Int32Type(), 0, false),
-		}, "")
-		builder.CreateStore(parent, gep)
-		builder.CreateStore(stackObject, stackChainStart)
+		builder.CreateStore(llvm.ConstNull(stackObjectType), stackObject)
+		builder.CreateCall(exposeType, expose, []llvm.Value{stackObject}, "")
 
 		// Do a store to the stack object after each new pointer that is created.
-		pointerStores := make(map[llvm.Value]struct{})
 		for i, ptr := range pointers {
 			// Insert the store after the pointer value is created.
 			insertionPoint := llvm.NextInstruction(ptr)
@@ -319,34 +291,35 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 			// Extract a pointer to the appropriate section of the stack object.
 			gep := builder.CreateGEP(stackObjectType, stackObject, []llvm.Value{
 				llvm.ConstInt(ctx.Int32Type(), 0, false),
-				llvm.ConstInt(ctx.Int32Type(), uint64(2+i), false),
+				llvm.ConstInt(ctx.Int32Type(), uint64(i), false),
 			}, "")
 
 			// Store the pointer into the stack slot.
-			store := builder.CreateStore(ptr, gep)
-			pointerStores[store] = struct{}{}
+			builder.CreateStore(ptr, gep)
 		}
 
-		// Make sure this stack object is popped from the linked list of stack
-		// objects at return.
+		// The stack object has to outlive every call that this function
+		// makes, as it is what keeps the arguments of those calls alive. A
+		// tail call would give up the frame, and the stack object with it,
+		// before the callee has run.
 		for _, ret := range returns {
-			// Check for any tail calls at this return.
 			prev := llvm.PrevInstruction(ret)
 			if !prev.IsNil() && !prev.IsABitCastInst().IsNil() {
 				// A bitcast can appear before a tail call, so skip backwards more.
 				prev = llvm.PrevInstruction(prev)
 			}
 			if !prev.IsNil() && !prev.IsACallInst().IsNil() {
-				// This is no longer a tail call.
 				prev.SetTailCall(false)
 			}
-			builder.SetInsertPointBefore(ret)
-			builder.CreateStore(parent, stackChainStart)
 		}
 	}
 
 	return true
 }
+
+// exposeStackObjectName is the function that every function with a stack
+// object passes that object to. See MakeGCStackSlots.
+const exposeStackObjectName = "tinygo_exposeStackObject"
 
 func makeGCGlobalRoots(mod llvm.Module) bool {
 	rootCount := mod.NamedFunction("runtime.gcGlobalRootCount")

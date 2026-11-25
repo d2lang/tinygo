@@ -15,9 +15,6 @@ type Task struct {
 	// Data is a field which can be used for storing state information.
 	Data uint64
 
-	// gcData holds data for the GC.
-	gcData gcData
-
 	// state is the underlying running state of the task.
 	state state
 

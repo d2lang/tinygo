@@ -69,15 +69,14 @@ func TestGCStackSlotCounts(t *testing.T) {
 }
 
 // stackSlotCount returns the number of pointer slots in the gc.stackobject of
-// fn. The stack object is {parent, numSlots, slots...}, so the count is the
-// number of struct fields beyond the first two.
+// fn, which has a field for each of them.
 func stackSlotCount(fn llvm.Value) (int, error) {
 	entry := fn.EntryBasicBlock()
 	for inst := entry.FirstInstruction(); !inst.IsNil(); inst = llvm.NextInstruction(inst) {
 		if inst.IsAAllocaInst().IsNil() || inst.Name() != "gc.stackobject" {
 			continue
 		}
-		return inst.AllocatedType().StructElementTypesCount() - 2, nil
+		return inst.AllocatedType().StructElementTypesCount(), nil
 	}
 	return 0, errors.New("no gc.stackobject in entry block")
 }

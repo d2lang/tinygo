@@ -41,9 +41,7 @@ func PauseLocked() {
 // Resume the task until it pauses or completes.
 // This may only be called from the scheduler.
 func (t *Task) Resume() {
-	t.gcData.swap()
 	t.state.resume()
-	t.gcData.swap()
 }
 
 //go:linkname lockScheduler runtime.lockScheduler

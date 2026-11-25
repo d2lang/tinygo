@@ -210,7 +210,6 @@ func (t *Task) Resume() {
 		// Save the system stack pointer.
 		saveStackPointer()
 	}
-	t.gcData.swap()
 	currentTask = t
 	t.state.running = true
 	if !t.state.launched {
@@ -221,14 +220,12 @@ func (t *Task) Resume() {
 	}
 	t.state.running = false
 	currentTask = prevTask
-	t.gcData.swap()
 	if uintptr(t.state.asyncifysp) > uintptr(t.state.csp) {
 		runtimeFatal("stack overflow")
 	}
 	if t.Exited {
 		runtime_freeTaskStack(t.state.stackBase)
 		t.state = state{}
-		t.gcData = gcData{}
 		t.DeferFrame = nil
 	} else if t.state.finishing {
 		// The task is complete. Clear stale stack pointers and release its argument bundle.
