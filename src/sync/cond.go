@@ -60,6 +60,9 @@ func (c *Cond) Broadcast() {
 }
 
 func (c *Cond) Wait() {
+	if !task.CanBlock {
+		task.Deadlock()
+	}
 	// Mark us as not yet signalled or sleeping.
 	t := task.Current()
 	dataPtr := (*task.Uint32)(unsafe.Pointer(&t.Data))

@@ -9,6 +9,9 @@ type Mutex struct {
 
 func (m *Mutex) Lock() {
 	if m.locked {
+		if !CanBlock {
+			Deadlock()
+		}
 		// Push self onto stack of blocked tasks, and wait to be resumed.
 		m.blocked.Push(Current())
 		Pause()

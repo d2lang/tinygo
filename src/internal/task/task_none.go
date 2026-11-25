@@ -9,7 +9,7 @@ var mainTask Task
 func runtimePanicSchedulerDisabled()
 
 func Pause() {
-	runtimePanicSchedulerDisabled()
+	Deadlock()
 }
 
 func Current() *Task {

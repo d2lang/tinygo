@@ -20,6 +20,10 @@ func (f *Futex) Wait(cmp uint32) (awoken bool) {
 		return false
 	}
 
+	if !CanBlock {
+		Deadlock()
+	}
+
 	// Push the current goroutine onto the waiter stack.
 	f.waiters.Push(Current())
 

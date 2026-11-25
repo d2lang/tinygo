@@ -266,6 +266,12 @@ func chanSend(ch *channel, value unsafe.Pointer, op *channelOp) {
 		return
 	}
 
+	if !task.CanBlock {
+		ch.lock.Unlock()
+		interrupt.Restore(mask)
+		task.Deadlock()
+	}
+
 	// Can't proceed. Add us to the list of senders and wait until we're awoken.
 	t := task.Current()
 	t.SetDataUint32(chanOperationWaiting)
@@ -347,6 +353,12 @@ func chanRecv(ch *channel, value unsafe.Pointer, op *channelOp) bool {
 		}
 		interrupt.Restore(mask)
 		return ok
+	}
+
+	if !task.CanBlock {
+		ch.lock.Unlock()
+		interrupt.Restore(mask)
+		task.Deadlock()
 	}
 
 	// We can't proceed, so we add ourselves to the list of receivers and wait
@@ -594,6 +606,13 @@ func chanSelect(recvbuf unsafe.Pointer, states []chanSelectState, ops []channelO
 		}
 		interrupt.Restore(mask)
 		return selectIndex, selectOk
+	}
+
+	if !task.CanBlock {
+		unlockAllStates(states)
+		chanSelectLock.Unlock()
+		interrupt.Restore(mask)
+		task.Deadlock()
 	}
 
 	// The select is blocking and no channel operation can proceed, so things
