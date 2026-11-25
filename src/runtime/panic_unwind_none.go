@@ -12,3 +12,6 @@ func clearPanicReplay() {
 func rewindPanic() bool {
 	return false
 }
+
+func abandonUnwind() {
+}

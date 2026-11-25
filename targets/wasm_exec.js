@@ -545,7 +545,12 @@
 			try {
 				this._inst.exports.resume();
 			} catch (e) {
-				if (e !== wasmExit) throw e;
+				if (e !== wasmExit) {
+					// A program without a scheduler ran the call on the one stack
+					// it has, and has to take back the part the call was using.
+					this._inst.exports.resume_failed?.();
+					throw e;
+				}
 			}
 			if (this.exited) {
 				this._resolveExitPromise();

@@ -9,6 +9,15 @@ tinygo_getCurrentStackPointer: // func getCurrentStackPointer() uintptr
     return
     end_function
 
+.global  tinygo_setCurrentStackPointer
+.hidden  tinygo_setCurrentStackPointer
+.type    tinygo_setCurrentStackPointer,@function
+tinygo_setCurrentStackPointer: // func setCurrentStackPointer(sp uintptr)
+    .functype tinygo_setCurrentStackPointer(i32) -> ()
+    local.get 0
+    global.set __stack_pointer
+    end_function
+
 // The garbage collector finds the pointers that a function holds by reading the
 // stack, where the compiler makes the function store them in a stack object.
 // LLVM cannot see that reader and would remove the stores. So every function
