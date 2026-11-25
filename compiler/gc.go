@@ -50,6 +50,11 @@ func (b *builder) trackExpr(expr ssa.Value, value llvm.Value) {
 		if !value.IsNil() {
 			b.trackValue(value)
 		}
+	case *ssa.Lookup:
+		// A value read from a map is copied out of the map through a
+		// temporary buffer. The map does not keep the copy alive: the entry
+		// may be replaced or deleted while the value is still in use.
+		b.trackValue(value)
 	case *ssa.Select:
 		if alloca, ok := b.selectRecvBuf[expr]; ok {
 			if alloca.IsAUndefValue().IsNil() {
