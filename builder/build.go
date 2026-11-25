@@ -805,10 +805,12 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 	result.Binary = result.Executable // final file
 	ldflags := append(config.LDFlags(), "-o", result.Executable)
 
-	if config.Scheduler() == "none" && strings.HasPrefix(config.Triple(), "wasm32-") {
+	if config.Options.StackSize != 0 && config.Scheduler() == "none" && strings.HasPrefix(config.Triple(), "wasm32-") {
 		// Everything runs on the linker-provided stack, so -stack-size has to
 		// size that one. With a scheduler it sizes goroutine stacks instead.
-		ldflags = append(ldflags, "-z", "stack-size="+strconv.FormatUint(config.StackSize(), 10))
+		// A target's default-stack-size describes goroutine stacks, so it is
+		// not used for this.
+		ldflags = append(ldflags, "-z", "stack-size="+strconv.FormatUint(config.Options.StackSize, 10))
 	}
 
 	if config.Options.BuildMode == "c-shared" {
