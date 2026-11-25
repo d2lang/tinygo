@@ -1,6 +1,8 @@
 package transform
 
 import (
+	"fmt"
+	"sort"
 	"strings"
 
 	"tinygo.org/x/go-llvm"
@@ -336,12 +338,42 @@ func makeGCGlobalRoots(mod llvm.Module) bool {
 		return false
 	}
 
+	// A runtime that declares these functions also scans runs: count ranges
+	// of the same size, each stride bytes after the one before it. A runtime
+	// that does not gets every range in the plain table.
+	runFuncs := []llvm.Value{
+		mod.NamedFunction("runtime.gcGlobalRootRunCount"),
+		mod.NamedFunction("runtime.gcGlobalRootRun"),
+		mod.NamedFunction("runtime.gcGlobalRootRunSize"),
+		mod.NamedFunction("runtime.gcGlobalRootRunStride"),
+		mod.NamedFunction("runtime.gcGlobalRootRunLength"),
+	}
+	useRuns := true
+	for _, fn := range runFuncs {
+		if fn.IsNil() {
+			useRuns = false
+		} else if !fn.FirstBasicBlock().IsNil() {
+			return false
+		}
+	}
+
 	ctx := mod.Context()
 	uintptrType := rootCount.GlobalValueType().ReturnType()
+	ptrType := rootAt.GlobalValueType().ReturnType()
 	targetData := llvm.NewTargetData(mod.DataLayout())
 	defer targetData.Dispose()
-	pointerBits := uint64(8 * targetData.PointerSize())
+	pointerSize := uint64(targetData.PointerSize())
+	pointerBits := 8 * pointerSize
+	rootType := ctx.StructType([]llvm.Type{ptrType, uintptrType}, false)
+	runType := ctx.StructType([]llvm.Type{ptrType, uintptrType, uintptrType, uintptrType}, false)
+	encoding := gcGlobalRootEncoding{
+		pointerSize: pointerSize,
+		rootBytes:   targetData.TypeAllocSize(rootType),
+		runBytes:    targetData.TypeAllocSize(runType),
+	}
 	var roots []gcGlobalRootRange
+	var runs []gcGlobalRootRun
+	var rootWords uint64
 	for global := mod.FirstGlobal(); !global.IsNil(); global = llvm.NextGlobal(global) {
 		if strings.HasPrefix(global.Name(), "llvm.") ||
 			global.IsGlobalConstant() ||
@@ -350,71 +382,67 @@ func makeGCGlobalRoots(mod llvm.Module) bool {
 			continue
 		}
 		typ := global.GlobalValueType()
+		var ranges []gcGlobalRootRange
 		if isRetypedPointerGlobal(typ, pointerBits) {
 			// Scan the whole integer, one pointer-sized word at a time.
 			size := targetData.TypeAllocSize(typ)
-			roots = appendGCGlobalRootRange(roots, global, 0, size, ctx.Int8Type(), uintptrType)
+			ranges = appendGCGlobalRootRange(ranges, global, 0, size)
+		} else if typeHasPointers(typ) {
+			ranges = appendGCGlobalRootRanges(ranges, global, typ, targetData)
+		}
+		for _, r := range ranges {
+			rootWords += r.size / pointerSize
+		}
+		if !useRuns {
+			roots = append(roots, ranges...)
 			continue
 		}
-		if !typeHasPointers(typ) {
-			continue
+		globalRoots, globalRuns := encoding.makeRuns(ranges)
+		if err := encoding.check(ranges, globalRoots, globalRuns); err != nil {
+			panic("transform: the root table for " + global.Name() + " does not scan the same words as its ranges: " + err.Error())
 		}
-		roots = appendGCGlobalRootRanges(roots, global, typ, targetData, ctx.Int8Type(), uintptrType)
+		roots = append(roots, globalRoots...)
+		runs = append(runs, globalRuns...)
 	}
-
-	ptrType := rootAt.GlobalValueType().ReturnType()
-	rootType := ctx.StructType([]llvm.Type{ptrType, uintptrType}, false)
-	rootInitializers := make([]llvm.Value, len(roots))
-	for i, root := range roots {
-		rootInitializers[i] = llvm.ConstNamedStruct(rootType, []llvm.Value{
-			root.address,
-			llvm.ConstInt(uintptrType, root.size, false),
-		})
-	}
-	rootArrayType := llvm.ArrayType(rootType, len(roots))
-	rootArray := llvm.AddGlobal(mod, rootArrayType, "runtime.gcGlobalRoots")
-	rootArray.SetInitializer(llvm.ConstArray(rootType, rootInitializers))
-	rootArray.SetGlobalConstant(true)
-	rootArray.SetLinkage(llvm.InternalLinkage)
 
 	builder := ctx.NewBuilder()
 	defer builder.Dispose()
 
-	entry := ctx.AddBasicBlock(rootCount, "entry")
-	builder.SetInsertPointAtEnd(entry)
-	builder.CreateRet(llvm.ConstInt(rootCount.GlobalValueType().ReturnType(), uint64(len(roots)), false))
+	rootInitializers := make([]llvm.Value, len(roots))
+	for i, root := range roots {
+		rootInitializers[i] = llvm.ConstNamedStruct(rootType, []llvm.Value{
+			root.address(ctx.Int8Type(), uintptrType),
+			llvm.ConstInt(uintptrType, root.size, false),
+		})
+	}
+	rootArrayType, rootArray := addGCGlobalRootTable(mod, "runtime.gcGlobalRoots", rootType, rootInitializers)
+	defineGCGlobalRootCount(builder, rootCount, len(roots))
+	defineGCGlobalRootField(builder, rootAt, rootArrayType, rootArray, rootType, 0)
+	defineGCGlobalRootField(builder, rootSize, rootArrayType, rootArray, rootType, 1)
 
-	entry = ctx.AddBasicBlock(rootAt, "entry")
-	builder.SetInsertPointAtEnd(entry)
-	index := rootAt.FirstParam()
-	root := builder.CreateInBoundsGEP(rootArrayType, rootArray, []llvm.Value{
-		llvm.ConstInt(ctx.Int32Type(), 0, false),
-		index,
-	}, "")
-	addr := builder.CreateStructGEP(rootType, root, 0, "")
-	builder.CreateRet(builder.CreateLoad(ptrType, addr, ""))
-
-	entry = ctx.AddBasicBlock(rootSize, "entry")
-	builder.SetInsertPointAtEnd(entry)
-	index = rootSize.FirstParam()
-	root = builder.CreateInBoundsGEP(rootArrayType, rootArray, []llvm.Value{
-		llvm.ConstInt(ctx.Int32Type(), 0, false),
-		index,
-	}, "")
-	size := builder.CreateStructGEP(rootType, root, 1, "")
-	builder.CreateRet(builder.CreateLoad(uintptrType, size, ""))
+	if useRuns {
+		runInitializers := make([]llvm.Value, len(runs))
+		for i, run := range runs {
+			runInitializers[i] = llvm.ConstNamedStruct(runType, []llvm.Value{
+				run.first.address(ctx.Int8Type(), uintptrType),
+				llvm.ConstInt(uintptrType, run.first.size, false),
+				llvm.ConstInt(uintptrType, run.stride, false),
+				llvm.ConstInt(uintptrType, run.count, false),
+			})
+		}
+		runArrayType, runArray := addGCGlobalRootTable(mod, "runtime.gcGlobalRootRuns", runType, runInitializers)
+		defineGCGlobalRootCount(builder, runFuncs[0], len(runs))
+		for field, fn := range runFuncs[1:] {
+			defineGCGlobalRootField(builder, fn, runArrayType, runArray, runType, field)
+		}
+	}
 
 	if !rootValues.IsNil() {
-		pointerSize := uint64(targetData.PointerSize())
-		var rootValueCount uint64
-		for _, root := range roots {
-			rootValueCount += root.size / pointerSize
-		}
-		rootValueArray := llvm.AddGlobal(mod, llvm.ArrayType(uintptrType, int(rootValueCount)), "runtime.gcGlobalRootValueArray")
+		rootValueArray := llvm.AddGlobal(mod, llvm.ArrayType(uintptrType, int(rootWords)), "runtime.gcGlobalRootValueArray")
 		rootValueArray.SetInitializer(llvm.ConstNull(rootValueArray.GlobalValueType()))
 		rootValueArray.SetLinkage(llvm.InternalLinkage)
 
-		entry = ctx.AddBasicBlock(rootValues, "entry")
+		entry := ctx.AddBasicBlock(rootValues, "entry")
 		builder.SetInsertPointAtEnd(entry)
 		builder.CreateRet(rootValueArray)
 	}
@@ -422,11 +450,171 @@ func makeGCGlobalRoots(mod llvm.Module) bool {
 	return true
 }
 
-// gcGlobalRootRange is a contiguous range of pointer slots.
-// It never includes padding or non-pointer fields.
+// addGCGlobalRootTable adds a constant array of root table entries.
+func addGCGlobalRootTable(mod llvm.Module, name string, entryType llvm.Type, entries []llvm.Value) (llvm.Type, llvm.Value) {
+	arrayType := llvm.ArrayType(entryType, len(entries))
+	array := llvm.AddGlobal(mod, arrayType, name)
+	array.SetInitializer(llvm.ConstArray(entryType, entries))
+	array.SetGlobalConstant(true)
+	array.SetLinkage(llvm.InternalLinkage)
+	return arrayType, array
+}
+
+// defineGCGlobalRootCount gives fn a body that returns count.
+func defineGCGlobalRootCount(builder llvm.Builder, fn llvm.Value, count int) {
+	entry := fn.Type().Context().AddBasicBlock(fn, "entry")
+	builder.SetInsertPointAtEnd(entry)
+	builder.CreateRet(llvm.ConstInt(fn.GlobalValueType().ReturnType(), uint64(count), false))
+}
+
+// defineGCGlobalRootField gives fn a body that returns the given field of the
+// table entry at the index fn takes.
+func defineGCGlobalRootField(builder llvm.Builder, fn llvm.Value, arrayType llvm.Type, array llvm.Value, entryType llvm.Type, field int) {
+	ctx := fn.Type().Context()
+	entry := ctx.AddBasicBlock(fn, "entry")
+	builder.SetInsertPointAtEnd(entry)
+	element := builder.CreateInBoundsGEP(arrayType, array, []llvm.Value{
+		llvm.ConstInt(ctx.Int32Type(), 0, false),
+		fn.FirstParam(),
+	}, "")
+	addr := builder.CreateStructGEP(entryType, element, field, "")
+	builder.CreateRet(builder.CreateLoad(fn.GlobalValueType().ReturnType(), addr, ""))
+}
+
+// gcGlobalRootRange is a contiguous range of pointer slots, size bytes at
+// offset in global. It never includes padding or non-pointer fields.
 type gcGlobalRootRange struct {
-	address llvm.Value
-	size    uint64
+	global       llvm.Value
+	offset, size uint64
+}
+
+// address returns the address of the first slot of the range.
+func (r gcGlobalRootRange) address(i8Type, uintptrType llvm.Type) llvm.Value {
+	if r.offset == 0 {
+		return r.global
+	}
+	return llvm.ConstGEP(i8Type, r.global, []llvm.Value{
+		llvm.ConstInt(uintptrType, r.offset, false),
+	})
+}
+
+// gcGlobalRootRun stands for count ranges of the same global and size: first,
+// and each further one stride bytes after the one before it. The runtime scans
+// each of them as a separate range, as if they were in the plain table.
+type gcGlobalRootRun struct {
+	first         gcGlobalRootRange
+	stride, count uint64
+}
+
+// gcGlobalRootEncoding knows the size of the entries of both tables.
+type gcGlobalRootEncoding struct {
+	pointerSize uint64 // the runtime scans a range one word of this size at a time
+	rootBytes   uint64 // size of an entry of the plain table
+	runBytes    uint64 // size of an entry of the run table
+}
+
+// gcGlobalRootMaxPeriod is the largest number of ranges per element (of an
+// array, or of a flat struct of equal parts) that makeRuns looks for.
+const gcGlobalRootMaxPeriod = 8
+
+// makeRuns encodes the ranges of one global, which are sorted by offset and do
+// not touch or overlap, as plain ranges and runs, taking the encoding that
+// needs the fewest bytes. An element of a table can have several separate
+// ranges of pointers (a struct with a pointer, an integer and a pointer): with
+// period p, each run takes every p-th range, so that such a table becomes p
+// runs.
+func (e gcGlobalRootEncoding) makeRuns(ranges []gcGlobalRootRange) (roots []gcGlobalRootRange, runs []gcGlobalRootRun) {
+	bestBytes := ^uint64(0)
+	for period := 1; period <= gcGlobalRootMaxPeriod && period <= len(ranges); period++ {
+		periodRoots, periodRuns := e.makeRunsWithPeriod(ranges, period)
+		bytes := uint64(len(periodRoots))*e.rootBytes + uint64(len(periodRuns))*e.runBytes
+		if bytes < bestBytes {
+			bestBytes = bytes
+			roots, runs = periodRoots, periodRuns
+		}
+	}
+	sort.SliceStable(roots, func(i, j int) bool { return roots[i].offset < roots[j].offset })
+	sort.SliceStable(runs, func(i, j int) bool { return runs[i].first.offset < runs[j].first.offset })
+	return roots, runs
+}
+
+func (e gcGlobalRootEncoding) makeRunsWithPeriod(ranges []gcGlobalRootRange, period int) (roots []gcGlobalRootRange, runs []gcGlobalRootRun) {
+	for phase := 0; phase < period; phase++ {
+		for i := phase; i < len(ranges); {
+			first := ranges[i]
+			count := uint64(1)
+			stride := uint64(0)
+			last := i
+			if next := i + period; next < len(ranges) && ranges[next].size == first.size && ranges[next].offset > first.offset {
+				stride = ranges[next].offset - first.offset
+				for last+period < len(ranges) &&
+					ranges[last+period].size == first.size &&
+					ranges[last+period].offset == ranges[last].offset+stride {
+					last += period
+					count++
+				}
+			}
+			if count*e.rootBytes > e.runBytes {
+				runs = append(runs, gcGlobalRootRun{first: first, stride: stride, count: count})
+				i = last + period
+			} else {
+				roots = append(roots, first)
+				i += period
+			}
+		}
+	}
+	return roots, runs
+}
+
+// check expands the plain ranges and runs back into the ranges and the words
+// the runtime scans, and returns an error unless they are exactly those of
+// ranges. The block collector scans each word of each range; the custom and
+// Boehm collectors pass each range to a function that scans it.
+func (e gcGlobalRootEncoding) check(ranges, roots []gcGlobalRootRange, runs []gcGlobalRootRun) error {
+	got := append([]gcGlobalRootRange(nil), roots...)
+	for _, run := range runs {
+		for k := uint64(0); k < run.count; k++ {
+			r := run.first
+			r.offset += k * run.stride
+			got = append(got, r)
+		}
+	}
+	want := append([]gcGlobalRootRange(nil), ranges...)
+	byOffset := func(s []gcGlobalRootRange) {
+		sort.SliceStable(s, func(i, j int) bool { return s[i].offset < s[j].offset })
+	}
+	byOffset(got)
+	byOffset(want)
+	if len(got) != len(want) {
+		return fmt.Errorf("%d ranges instead of %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return fmt.Errorf("range %d is %d+%d instead of %d+%d", i, got[i].offset, got[i].size, want[i].offset, want[i].size)
+		}
+	}
+	gotWords, wantWords := e.words(got), e.words(want)
+	if len(gotWords) != len(wantWords) {
+		return fmt.Errorf("%d words instead of %d", len(gotWords), len(wantWords))
+	}
+	for i := range wantWords {
+		if gotWords[i] != wantWords[i] {
+			return fmt.Errorf("word %d is at %d instead of %d", i, gotWords[i], wantWords[i])
+		}
+	}
+	return nil
+}
+
+// words returns the offsets of the words the block collector reads for the
+// given ranges (see markGlobals in src/runtime/gc_globals_blocks.go).
+func (e gcGlobalRootEncoding) words(ranges []gcGlobalRootRange) []uint64 {
+	var words []uint64
+	for _, r := range ranges {
+		for offset := uint64(0); offset < r.size; offset += e.pointerSize {
+			words = append(words, r.offset+offset)
+		}
+	}
+	return words
 }
 
 // isRetypedPointerGlobal reports whether a global of type typ, which has no
@@ -446,7 +634,7 @@ func isRetypedPointerGlobal(typ llvm.Type, pointerBits uint64) bool {
 	return width == pointerBits || width == 2*pointerBits
 }
 
-func appendGCGlobalRootRanges(roots []gcGlobalRootRange, global llvm.Value, typ llvm.Type, targetData llvm.TargetData, i8Type, uintptrType llvm.Type) []gcGlobalRootRange {
+func appendGCGlobalRootRanges(roots []gcGlobalRootRange, global llvm.Value, typ llvm.Type, targetData llvm.TargetData) []gcGlobalRootRange {
 	var offsets []uint64
 	offsets = appendGCGlobalRootOffsets(offsets, typ, targetData, 0)
 	if len(offsets) == 0 {
@@ -461,21 +649,15 @@ func appendGCGlobalRootRanges(roots []gcGlobalRootRange, global llvm.Value, typ 
 			rangeEnd += pointerSize
 			continue
 		}
-		roots = appendGCGlobalRootRange(roots, global, rangeStart, rangeEnd-rangeStart, i8Type, uintptrType)
+		roots = appendGCGlobalRootRange(roots, global, rangeStart, rangeEnd-rangeStart)
 		rangeStart = offset
 		rangeEnd = offset + pointerSize
 	}
-	return appendGCGlobalRootRange(roots, global, rangeStart, rangeEnd-rangeStart, i8Type, uintptrType)
+	return appendGCGlobalRootRange(roots, global, rangeStart, rangeEnd-rangeStart)
 }
 
-func appendGCGlobalRootRange(roots []gcGlobalRootRange, global llvm.Value, offset, size uint64, i8Type, uintptrType llvm.Type) []gcGlobalRootRange {
-	address := global
-	if offset != 0 {
-		address = llvm.ConstGEP(i8Type, global, []llvm.Value{
-			llvm.ConstInt(uintptrType, offset, false),
-		})
-	}
-	return append(roots, gcGlobalRootRange{address: address, size: size})
+func appendGCGlobalRootRange(roots []gcGlobalRootRange, global llvm.Value, offset, size uint64) []gcGlobalRootRange {
+	return append(roots, gcGlobalRootRange{global: global, offset: offset, size: size})
 }
 
 func appendGCGlobalRootOffsets(offsets []uint64, typ llvm.Type, targetData llvm.TargetData, baseOffset uint64) []uint64 {

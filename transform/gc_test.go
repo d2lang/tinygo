@@ -22,6 +22,13 @@ func TestMakeGCGlobalRootsAVR(t *testing.T) {
 	})
 }
 
+func TestMakeGCGlobalRootRuns(t *testing.T) {
+	t.Parallel()
+	testTransform(t, "testdata/gc-globals-runs", func(mod llvm.Module) {
+		transform.MakeGCStackSlots(mod)
+	})
+}
+
 // TestGCStackSlotCounts checks slot counts without comparing unrelated IR to a golden file.
 // See https://github.com/tinygo-org/tinygo/pull/5762#discussion_r4113188988.
 func TestGCStackSlotCounts(t *testing.T) {

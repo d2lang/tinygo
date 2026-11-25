@@ -6,12 +6,23 @@ import "unsafe"
 
 func markGlobals() {
 	for i := uintptr(0); i < gcGlobalRootCount(); i++ {
-		addr := gcGlobalRoot(i)
-		size := gcGlobalRootSize(i)
-		for offset := uintptr(0); offset < size; offset += unsafe.Sizeof(uintptr(0)) {
-			slot := unsafe.Add(addr, offset)
-			markRoot(uintptr(slot), *(*uintptr)(slot))
+		markGlobalRange(gcGlobalRoot(i), gcGlobalRootSize(i))
+	}
+	for i := uintptr(0); i < gcGlobalRootRunCount(); i++ {
+		addr := gcGlobalRootRun(i)
+		size := gcGlobalRootRunSize(i)
+		stride := gcGlobalRootRunStride(i)
+		for n := gcGlobalRootRunLength(i); n != 0; n-- {
+			markGlobalRange(addr, size)
+			addr = unsafe.Add(addr, stride)
 		}
+	}
+}
+
+func markGlobalRange(addr unsafe.Pointer, size uintptr) {
+	for offset := uintptr(0); offset < size; offset += unsafe.Sizeof(uintptr(0)) {
+		slot := unsafe.Add(addr, offset)
+		markRoot(uintptr(slot), *(*uintptr)(slot))
 	}
 }
 
@@ -20,3 +31,12 @@ func markGlobals() {
 func gcGlobalRootCount() uintptr
 func gcGlobalRoot(index uintptr) unsafe.Pointer
 func gcGlobalRootSize(index uintptr) uintptr
+
+// Runs of ranges: gcGlobalRootRunLength(i) ranges of gcGlobalRootRunSize(i)
+// bytes, the first at gcGlobalRootRun(i) and each further one
+// gcGlobalRootRunStride(i) bytes after the one before it.
+func gcGlobalRootRunCount() uintptr
+func gcGlobalRootRun(index uintptr) unsafe.Pointer
+func gcGlobalRootRunSize(index uintptr) uintptr
+func gcGlobalRootRunStride(index uintptr) uintptr
+func gcGlobalRootRunLength(index uintptr) uintptr
