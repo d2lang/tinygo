@@ -340,15 +340,26 @@ func makeGCGlobalRoots(mod llvm.Module) bool {
 	uintptrType := rootCount.GlobalValueType().ReturnType()
 	targetData := llvm.NewTargetData(mod.DataLayout())
 	defer targetData.Dispose()
+	pointerBits := uint64(8 * targetData.PointerSize())
 	var roots []gcGlobalRootRange
 	for global := mod.FirstGlobal(); !global.IsNil(); global = llvm.NextGlobal(global) {
 		if strings.HasPrefix(global.Name(), "llvm.") ||
 			global.IsGlobalConstant() ||
 			global.Initializer().IsNil() ||
-			!typeHasPointers(global.GlobalValueType()) {
+			global.Type().PointerAddressSpace() != 0 { // not in memory, such as a WebAssembly global
 			continue
 		}
-		roots = appendGCGlobalRootRanges(roots, global, global.GlobalValueType(), targetData, ctx.Int8Type(), uintptrType)
+		typ := global.GlobalValueType()
+		if isRetypedPointerGlobal(typ, pointerBits) {
+			// Scan the whole integer, one pointer-sized word at a time.
+			size := targetData.TypeAllocSize(typ)
+			roots = appendGCGlobalRootRange(roots, global, 0, size, ctx.Int8Type(), uintptrType)
+			continue
+		}
+		if !typeHasPointers(typ) {
+			continue
+		}
+		roots = appendGCGlobalRootRanges(roots, global, typ, targetData, ctx.Int8Type(), uintptrType)
 	}
 
 	ptrType := rootAt.GlobalValueType().ReturnType()
@@ -416,6 +427,23 @@ func makeGCGlobalRoots(mod llvm.Module) bool {
 type gcGlobalRootRange struct {
 	address llvm.Value
 	size    uint64
+}
+
+// isRetypedPointerGlobal reports whether a global of type typ, which has no
+// pointer type in it, may still hold pointers: an integer one or two pointers
+// wide. LLVM can change the type of a global. When a global is only ever copied
+// in and out of whole, InstCombine turns those copies into loads and stores of
+// an integer of the same size (it does so for copies of four or eight bytes),
+// and GlobalOpt then gives the global that integer type: a [2]*T becomes an
+// i64. Integers inside aggregates are not treated this way: a table of numbers
+// scanned like pointers would keep whatever lies at those addresses alive once
+// the heap is large enough to reach them.
+func isRetypedPointerGlobal(typ llvm.Type, pointerBits uint64) bool {
+	if typ.TypeKind() != llvm.IntegerTypeKind {
+		return false
+	}
+	width := uint64(typ.IntTypeWidth())
+	return width == pointerBits || width == 2*pointerBits
 }
 
 func appendGCGlobalRootRanges(roots []gcGlobalRootRange, global llvm.Value, typ llvm.Type, targetData llvm.TargetData, i8Type, uintptrType llvm.Type) []gcGlobalRootRange {

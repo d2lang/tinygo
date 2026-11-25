@@ -1,12 +1,17 @@
 target datalayout = "e-m:e-p:32:32-i64:64-n32:64-S128"
 target triple = "wasm32-unknown-unknown-wasm"
 
+
 @someGlobal = global i8 3
 @ptrGlobal = global ptr null
 @arrGlobal = global [8 x i8] zeroinitializer
 @structGlobal = global {ptr, i32, [2 x ptr]} zeroinitializer
 @ptrArrayGlobal = global [8 x ptr] zeroinitializer
 @constantPtrGlobal = constant ptr @someGlobal
+@retypedGlobal = global i64 0
+@retypedSingleGlobal = global i32 0
+@smallIntGlobal = global i16 0
+@floatGlobal = global double 0.0
 
 declare void @runtime.trackPointer(ptr nocapture readonly)
 
