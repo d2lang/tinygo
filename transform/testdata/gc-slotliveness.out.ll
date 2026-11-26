@@ -700,6 +700,38 @@ end:                                              ; preds = %loop
   ret i32 %v
 }
 
+define i8 @stringSliced() {
+entry:
+  %gc.stackobject = alloca { ptr, ptr }, align 8
+  store { ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %s = call { ptr, i32 } @makeString()
+  %0 = extractvalue { ptr, i32 } %s, 0
+  %1 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
+  store ptr %0, ptr %1, align 4
+  br label %loop
+
+loop:                                             ; preds = %loop, %entry
+  %cur = phi { ptr, i32 } [ %s, %entry ], [ %rest, %loop ]
+  %2 = extractvalue { ptr, i32 } %cur, 0
+  %3 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
+  store ptr %2, ptr %3, align 4
+  call void @collect()
+  %data = extractvalue { ptr, i32 } %cur, 0
+  %behind = getelementptr i8, ptr %data, i32 -1
+  %c = load i8, ptr %behind, align 1
+  %next = getelementptr i8, ptr %data, i32 1
+  %len = extractvalue { ptr, i32 } %cur, 1
+  %len.next = sub i32 %len, 1
+  %r0 = insertvalue { ptr, i32 } undef, ptr %next, 0
+  %rest = insertvalue { ptr, i32 } %r0, i32 %len.next, 1
+  %done = icmp eq i32 %len.next, 0
+  br i1 %done, label %end, label %loop
+
+end:                                              ; preds = %loop
+  ret i8 %c
+}
+
 define i32 @integerStepsFromLoad(ptr %from) {
 entry:
   %gc.stackobject = alloca { i32, i32 }, align 8

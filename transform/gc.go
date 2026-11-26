@@ -1386,9 +1386,14 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 		for u := f.useStart[agg]; u < f.useStart[agg+1]; u++ {
 			slot := f.uses[u]
 			user := f.opInst[slot]
-			if skip(user) || f.boundary[user] {
+			if skip(user) {
+				continue
+			}
+			if f.boundary[user] && !(needed[user] && f.isCyclicPhi(user) && f.selfDerived(user)) {
 				// Its slot roots the field. A value with a slot that the
-				// search passes through holds it as well, see chosen.
+				// search passes through holds it as well, see chosen; but
+				// a phi in a loop that steps through an object needs what it
+				// starts from.
 				continue
 			}
 			if needed[user] && f.carries(agg, user, slot) {

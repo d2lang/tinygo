@@ -618,6 +618,31 @@ end:
   ret i32 %v
 }
 
+; A string that is sliced in a loop steps its data pointer: the string it
+; starts from, which a call returned, needs its pointer in a slot too.
+define i8 @stringSliced() {
+entry:
+  %s = call { ptr, i32 } @makeString()
+  br label %loop
+
+loop:
+  %cur = phi { ptr, i32 } [ %s, %entry ], [ %rest, %loop ]
+  call void @collect()
+  %data = extractvalue { ptr, i32 } %cur, 0
+  %behind = getelementptr i8, ptr %data, i32 -1
+  %c = load i8, ptr %behind
+  %next = getelementptr i8, ptr %data, i32 1
+  %len = extractvalue { ptr, i32 } %cur, 1
+  %len.next = sub i32 %len, 1
+  %r0 = insertvalue { ptr, i32 } undef, ptr %next, 0
+  %rest = insertvalue { ptr, i32 } %r0, i32 %len.next, 1
+  %done = icmp eq i32 %len.next, 0
+  br i1 %done, label %end, label %loop
+
+end:
+  ret i8 %c
+}
+
 ; The same with the address stepped as an integer that a load made.
 define i32 @integerStepsFromLoad(ptr %from) {
 entry:
