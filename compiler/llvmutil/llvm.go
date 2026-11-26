@@ -310,6 +310,12 @@ func NoCaptureAttrName() string {
 	return "nocapture"
 }
 
+// NoPointerMDName is the metadata the compiler puts on a load of a Go value
+// made of integers, floats and booleans only (not a uintptr or an
+// unsafe.Pointer), so that the GC stack slot pass need not take the integers
+// it reads for pointers. See transform.MakeGCStackSlots.
+const NoPointerMDName = "tinygo.noptr"
+
 // IsNoCapture reports whether attr (looked up using the kind returned by
 // NoCaptureAttrName) indicates that the pointer it is attached to does not
 // escape by capture. It returns false for a nil attribute.

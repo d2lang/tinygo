@@ -1,0 +1,5 @@
+copiedPointer -1
+copiedPair -1
+copiedInterface -1
+copiedAgainstNew -1
+assigned -1

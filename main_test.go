@@ -1088,7 +1088,11 @@ func runGCLivenessTest(options compileopts.Options, t *testing.T) {
 // not root a pointer, with the collector that makes a lost object show
 // (-tags=gc.stress), with and without a scheduler.
 func runGCRootsTest(options compileopts.Options, t *testing.T) {
-	for _, name := range []string{"gc-maplookup.go", "gc-retyped-global.go"} {
+	t.Run("gc-roots.go", func(t *testing.T) {
+		t.Parallel()
+		runTest("gc-roots.go", options, t, nil, nil)
+	})
+	for _, name := range []string{"gc-roots.go", "gc-intcopy.go", "gc-identity.go", "gc-liveness-repro.go", "gc.go", "gc-maplookup.go", "gc-retyped-global.go"} {
 		for _, scheduler := range []string{"asyncify", "none"} {
 			t.Run(name+"-gc-stress-scheduler-"+scheduler, func(t *testing.T) {
 				t.Parallel()

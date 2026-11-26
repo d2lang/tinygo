@@ -2,9 +2,11 @@ package transform
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
+	"github.com/tinygo-org/tinygo/compiler/llvmutil"
 	"tinygo.org/x/go-llvm"
 )
 
@@ -15,6 +17,10 @@ const shiftExcludeArgMem = 2
 
 // MakeGCStackSlots converts all calls to runtime.trackPointer to explicit
 // stores to stack slots that are scannable by the GC.
+//
+// A pointer only gets a slot if a collection can find it in use: see
+// gcSlotFunc for the rule, and for what keeps it true in the code that LLVM
+// makes of the result.
 func MakeGCStackSlots(mod llvm.Module) bool {
 	hasGlobalRoots := makeGCGlobalRoots(mod)
 
@@ -36,10 +42,22 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 	ctx := mod.Context()
 	builder := ctx.NewBuilder()
 	defer builder.Dispose()
+	targetData := llvm.NewTargetData(mod.DataLayout())
+	defer targetData.Dispose()
 
 	// All functions that call runtime.alloc needs stack objects.
 	trackFuncs := map[llvm.Value]struct{}{}
 	markParentFunctions(trackFuncs, alloc)
+
+	// The functions without a body that may run a collection, and the
+	// functions of the runtime that do.
+	collectors := map[llvm.Value]struct{}{alloc: {}}
+	for _, name := range []string{"runtime.GC", "runtime.runGC"} {
+		if fn := mod.NamedFunction(name); !fn.IsNil() {
+			collectors[fn] = struct{}{}
+			markParentFunctions(trackFuncs, fn)
+		}
+	}
 
 	// External functions may indirectly suspend the goroutine or perform a heap allocation.
 	// Their callers should get stack objects.
@@ -65,6 +83,7 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 		}
 
 		// The callers need stack objects.
+		collectors[fn] = struct{}{}
 		markParentFunctions(trackFuncs, fn)
 	}
 
@@ -107,216 +126,1641 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 		expose = llvm.AddFunction(mod, exposeStackObjectName, exposeType)
 	}
 
-	// Iterate until runtime.trackPointer has no uses left.
-	for use := trackPointer.FirstUse(); !use.IsNil(); use = trackPointer.FirstUse() {
-		// Pick the first use of runtime.trackPointer.
-		call := use.User()
-		if call.IsACallInst().IsNil() {
-			panic("expected runtime.trackPointer use to be a call")
+	pass := &gcSlotPass{
+		ctx:          ctx,
+		builder:      builder,
+		targetData:   targetData,
+		trackPointer: trackPointer,
+		expose:       expose,
+		exposeType:   exposeType,
+		trackFuncs:   trackFuncs,
+		collectors:   collectors,
+		// Without the table of global roots the collector reads globals in
+		// a way that LLVM cannot see, so nothing below can rely on a pointer
+		// in a global being there. Give every pointer a slot, as before.
+		prune:         hasGlobalRoots,
+		noAliasKind:   llvm.AttributeKindID("noalias"),
+		readOnlyKind:  llvm.AttributeKindID("readonly"),
+		readNoneKind:  llvm.AttributeKindID("readnone"),
+		noCaptureKind: llvm.AttributeKindID(llvmutil.NoCaptureAttrName()),
+		twiceKind:     llvm.AttributeKindID("returns_twice"),
+		memoryKind:    memAttr,
+		noPointerKind: ctx.MDKindID(llvmutil.NoPointerMDName),
+	}
+	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
+		if fn.FirstBasicBlock().IsNil() {
+			continue
 		}
-
-		// Pick the parent function.
-		fn := call.InstructionParent().Parent()
-
 		if _, ok := trackFuncs[fn]; !ok {
 			// This function nor any of the functions it calls (recursively)
 			// allocate anything from the heap, so it will not trigger a garbage
 			// collection cycle. Thus, it does not need to track local pointer
 			// values.
-			// This is a useful optimization but not as big as you might guess,
-			// as described above (it avoids stack objects for ~12% of
-			// functions).
-			call.EraseFromParentAsInstruction()
 			continue
 		}
+		pass.run(fn)
+	}
 
-		// Find all calls to runtime.trackPointer in this function.
-		var calls []llvm.Value
-		var returns []llvm.Value
-		for bb := fn.FirstBasicBlock(); !bb.IsNil(); bb = llvm.NextBasicBlock(bb) {
-			for inst := bb.FirstInstruction(); !inst.IsNil(); inst = llvm.NextInstruction(inst) {
-				switch inst.InstructionOpcode() {
-				case llvm.Call:
-					if inst.CalledValue() == trackPointer {
-						calls = append(calls, inst)
-					}
-				case llvm.Ret:
-					returns = append(returns, inst)
-				}
+	// What is left are the calls in functions that cannot collect.
+	for _, call := range getUses(trackPointer) {
+		call.EraseFromParentAsInstruction()
+	}
+
+	return true
+}
+
+// gcSlotPass is the state MakeGCStackSlots shares between functions.
+type gcSlotPass struct {
+	ctx          llvm.Context
+	builder      llvm.Builder
+	targetData   llvm.TargetData
+	trackPointer llvm.Value
+	expose       llvm.Value
+	exposeType   llvm.Type
+	trackFuncs   map[llvm.Value]struct{}
+	collectors   map[llvm.Value]struct{}
+	prune        bool
+
+	noAliasKind, readOnlyKind, readNoneKind, noCaptureKind, twiceKind, memoryKind uint
+
+	// noPointerKind is the metadata kind of llvmutil.NoPointerMDName.
+	noPointerKind int
+}
+
+// run gives fn its stack object.
+func (p *gcSlotPass) run(fn llvm.Value) {
+	// Find all calls to runtime.trackPointer in this function.
+	var calls []llvm.Value
+	for bb := fn.FirstBasicBlock(); !bb.IsNil(); bb = llvm.NextBasicBlock(bb) {
+		for inst := bb.FirstInstruction(); !inst.IsNil(); inst = llvm.NextInstruction(inst) {
+			if inst.InstructionOpcode() == llvm.Call && inst.CalledValue() == p.trackPointer {
+				calls = append(calls, inst)
 			}
 		}
+	}
 
-		// Determine what to do with each call.
-		var pointers []llvm.Value
-		rooted := make(map[llvm.Value]struct{}, len(calls))
-		var cyclicPHIs []llvm.Value
-		for _, call := range calls {
-			ptr := call.Operand(0)
-			call.EraseFromParentAsInstruction()
+	// Determine what to do with each call.
+	var pointers []llvm.Value
+	rooted := make(map[llvm.Value]struct{}, len(calls))
+	var cyclicPHIs []llvm.Value
+	for _, call := range calls {
+		ptr := call.Operand(0)
+		call.EraseFromParentAsInstruction()
 
-			// Some trivial optimizations.
-			if ptr.IsAInstruction().IsNil() {
-				continue
-			}
-			if _, ok := rooted[ptr]; ok {
-				continue
-			}
-			switch ptr.InstructionOpcode() {
-			case llvm.GetElementPtr:
-				// Check for all zero offsets.
-				// Sometimes LLVM rewrites bitcasts to zero-index GEPs, and we still need to track the GEP.
-				n := ptr.OperandsCount()
-				var hasOffset bool
-				for i := 1; i < n; i++ {
-					offset := ptr.Operand(i)
-					if offset.IsAConstantInt().IsNil() || offset.ZExtValue() != 0 {
-						hasOffset = true
-						break
-					}
-				}
-
-				if hasOffset {
-					// These values do not create new values: the values already
-					// existed locally in this function so must have been tracked
-					// already.
-					continue
-				}
-			case llvm.PHI:
-				// A phi gets a slot of its own because its value can change,
-				// so tracking an input instead is not enough. A phi that can
-				// be re-evaluated has its slot overwritten on the way round
-				// and so only roots the value the current iteration selected,
-				// so remember it and give its inputs slots below.
-				if blockInCycle(ptr.InstructionParent()) {
-					cyclicPHIs = append(cyclicPHIs, ptr)
-				}
-			case llvm.ExtractValue, llvm.BitCast:
-				// These instructions do not create new values, but their
-				// original value may not be tracked. So keep tracking them for
-				// now.
-				// With more analysis, it should be possible to optimize a
-				// significant chunk of these away.
-			case llvm.Call, llvm.Load, llvm.IntToPtr:
-				// These create new values so must be stored locally. But
-				// perhaps some of these can be fused when they actually refer
-				// to the same value.
-			default:
-				// Ambiguous. These instructions are uncommon, but perhaps could
-				// be optimized if needed.
-			}
-
-			if ptr := stripPointerCasts(ptr); !ptr.IsAAllocaInst().IsNil() {
-				// Allocas don't need to be tracked because they are allocated
-				// on the C stack which is scanned separately.
-				continue
-			}
-			rooted[ptr] = struct{}{}
-			pointers = append(pointers, ptr)
-		}
-
-		// Give every input of a tracked phi that can repeat a slot of its own.
-		// SimplifyCFG may have merged the trackPointer calls of two unrelated
-		// pointers into a single call on this phi, leaving whichever pointer
-		// the phi did not select unrooted while it is still live.
-		//
-		// Inputs are followed only through phis that can themselves repeat.
-		// A merge that runs at most once stores its slot once and never
-		// overwrites it, so that slot continues to root the selected value
-		// for the rest of the frame.
-		//
-		// Inputs are not screened by the non-zero-offset GEP rule the loop
-		// above applies, so an interior pointer whose base is already tracked
-		// can pick up a slot of its own. That is another slot rather than
-		// another root, so it is left alone for now.
-		if len(cyclicPHIs) != 0 {
-			expanded := make(map[llvm.Value]struct{}, len(cyclicPHIs))
-			worklist := append([]llvm.Value(nil), cyclicPHIs...)
-			for len(worklist) != 0 {
-				phi := worklist[len(worklist)-1]
-				worklist = worklist[:len(worklist)-1]
-				if _, ok := expanded[phi]; ok {
-					// Phis can be cyclic, so only expand each one once.
-					continue
-				}
-				expanded[phi] = struct{}{}
-				for i := 0; i < phi.IncomingCount(); i++ {
-					incoming := phi.IncomingValue(i)
-					if incoming.IsAInstruction().IsNil() {
-						// Constants and arguments cannot be given a slot here.
-						continue
-					}
-					if incoming.InstructionOpcode() == llvm.PHI && blockInCycle(incoming.InstructionParent()) {
-						worklist = append(worklist, incoming)
-					}
-					if stripped := stripPointerCasts(incoming); !stripped.IsAAllocaInst().IsNil() {
-						// Allocas live on the C stack, which is scanned separately.
-						continue
-					}
-					if _, ok := rooted[incoming]; ok {
-						continue
-					}
-					rooted[incoming] = struct{}{}
-					pointers = append(pointers, incoming)
-				}
-			}
-		}
-
-		if len(pointers) == 0 {
-			// This function does not need to keep track of stack pointers.
+		// Some trivial optimizations.
+		if ptr.IsAInstruction().IsNil() {
 			continue
 		}
+		if _, ok := rooted[ptr]; ok {
+			continue
+		}
+		switch ptr.InstructionOpcode() {
+		case llvm.GetElementPtr:
+			// Check for all zero offsets.
+			// Sometimes LLVM rewrites bitcasts to zero-index GEPs, and we still need to track the GEP.
+			n := ptr.OperandsCount()
+			var hasOffset bool
+			for i := 1; i < n; i++ {
+				offset := ptr.Operand(i)
+				if offset.IsAConstantInt().IsNil() || offset.ZExtValue() != 0 {
+					hasOffset = true
+					break
+				}
+			}
 
+			if hasOffset {
+				// These values do not create new values: the values already
+				// existed locally in this function so must have been tracked
+				// already.
+				continue
+			}
+		case llvm.PHI:
+			// A phi gets a slot of its own because its value can change,
+			// so tracking an input instead is not enough. A phi that can
+			// be re-evaluated has its slot overwritten on the way round
+			// and so only roots the value the current iteration selected,
+			// so remember it and give its inputs slots below.
+			if blockInCycle(ptr.InstructionParent()) {
+				cyclicPHIs = append(cyclicPHIs, ptr)
+			}
+		case llvm.ExtractValue, llvm.BitCast:
+			// These instructions do not create new values, but their
+			// original value may not be tracked. So keep tracking them for
+			// now.
+			// With more analysis, it should be possible to optimize a
+			// significant chunk of these away.
+		case llvm.Call, llvm.Load, llvm.IntToPtr:
+			// These create new values so must be stored locally. But
+			// perhaps some of these can be fused when they actually refer
+			// to the same value.
+		default:
+			// Ambiguous. These instructions are uncommon, but perhaps could
+			// be optimized if needed.
+		}
+
+		if ptr := stripPointerCasts(ptr); !ptr.IsAAllocaInst().IsNil() {
+			// Allocas don't need to be tracked because they are allocated
+			// on the C stack which is scanned separately.
+			continue
+		}
+		rooted[ptr] = struct{}{}
+		pointers = append(pointers, ptr)
+	}
+
+	// Give every input of a tracked phi that can repeat a slot of its own.
+	// SimplifyCFG may have merged the trackPointer calls of two unrelated
+	// pointers into a single call on this phi, leaving whichever pointer
+	// the phi did not select unrooted while it is still live.
+	//
+	// Inputs are followed only through phis that can themselves repeat.
+	// A merge that runs at most once stores its slot once and never
+	// overwrites it, so that slot continues to root the selected value
+	// for the rest of the frame.
+	//
+	// Inputs are not screened by the non-zero-offset GEP rule the loop
+	// above applies, so an interior pointer whose base is already tracked
+	// can pick up a slot of its own. That is another slot rather than
+	// another root, so it is left alone for now.
+	if len(cyclicPHIs) != 0 {
+		expanded := make(map[llvm.Value]struct{}, len(cyclicPHIs))
+		worklist := append([]llvm.Value(nil), cyclicPHIs...)
+		for len(worklist) != 0 {
+			phi := worklist[len(worklist)-1]
+			worklist = worklist[:len(worklist)-1]
+			if _, ok := expanded[phi]; ok {
+				// Phis can be cyclic, so only expand each one once.
+				continue
+			}
+			expanded[phi] = struct{}{}
+			for i := 0; i < phi.IncomingCount(); i++ {
+				incoming := phi.IncomingValue(i)
+				if incoming.IsAInstruction().IsNil() {
+					// Constants and arguments cannot be given a slot here.
+					continue
+				}
+				if incoming.InstructionOpcode() == llvm.PHI && blockInCycle(incoming.InstructionParent()) {
+					worklist = append(worklist, incoming)
+				}
+				if stripped := stripPointerCasts(incoming); !stripped.IsAAllocaInst().IsNil() {
+					// Allocas live on the C stack, which is scanned separately.
+					continue
+				}
+				if _, ok := rooted[incoming]; ok {
+					continue
+				}
+				rooted[incoming] = struct{}{}
+				pointers = append(pointers, incoming)
+			}
+		}
+	}
+
+	exposed := false
+	if p.prune {
+		// Only keep the pointers that a collection can find in use, and
+		// keep LLVM from carrying the others across a collection.
+		f := p.newSlotFunc(fn)
+		pointers = f.liveSlots(pointers)
+		exposed = f.expose(pointers)
+	}
+
+	if len(pointers) != 0 {
 		// The stack object has a slot for every pointer.
 		fields := make([]llvm.Type, len(pointers))
 		for i, ptr := range pointers {
 			fields[i] = ptr.Type()
 		}
-		stackObjectType := ctx.StructType(fields, false)
+		stackObjectType := p.ctx.StructType(fields, false)
 
 		// Create the stack object at the function entry, with nothing in it.
-		builder.SetInsertPointBefore(fn.EntryBasicBlock().FirstInstruction())
-		stackObject := builder.CreateAlloca(stackObjectType, "gc.stackobject")
-		builder.CreateStore(llvm.ConstNull(stackObjectType), stackObject)
-		builder.CreateCall(exposeType, expose, []llvm.Value{stackObject}, "")
+		p.builder.SetInsertPointBefore(fn.EntryBasicBlock().FirstInstruction())
+		stackObject := p.builder.CreateAlloca(stackObjectType, "gc.stackobject")
+		p.builder.CreateStore(llvm.ConstNull(stackObjectType), stackObject)
+		p.builder.CreateCall(p.exposeType, p.expose, []llvm.Value{stackObject}, "")
+		exposed = true
 
 		// Do a store to the stack object after each new pointer that is created.
 		for i, ptr := range pointers {
 			// Insert the store after the pointer value is created.
-			insertionPoint := llvm.NextInstruction(ptr)
-			for !insertionPoint.IsAPHINode().IsNil() {
-				// PHI nodes are required to be at the start of the block.
-				// Insert after the last PHI node.
-				insertionPoint = llvm.NextInstruction(insertionPoint)
-			}
-			builder.SetInsertPointBefore(insertionPoint)
+			p.builder.SetInsertPointBefore(instructionAfter(ptr))
 
 			// Extract a pointer to the appropriate section of the stack object.
-			gep := builder.CreateGEP(stackObjectType, stackObject, []llvm.Value{
-				llvm.ConstInt(ctx.Int32Type(), 0, false),
-				llvm.ConstInt(ctx.Int32Type(), uint64(i), false),
+			gep := p.builder.CreateGEP(stackObjectType, stackObject, []llvm.Value{
+				llvm.ConstInt(p.ctx.Int32Type(), 0, false),
+				llvm.ConstInt(p.ctx.Int32Type(), uint64(i), false),
 			}, "")
 
 			// Store the pointer into the stack slot.
-			builder.CreateStore(ptr, gep)
+			p.builder.CreateStore(ptr, gep)
+		}
+	}
+
+	if exposed {
+		// What this function exposed has to stay as it is across every call
+		// that the function makes: its stack object keeps the arguments of
+		// those calls alive, and the collector reads all of it. LLVM takes a
+		// call marked 'tail' to leave the caller's stack alone, and would
+		// move a store into a stack object or a variable past such a call.
+		// Calls after the first exposed pointer do not get the mark again.
+		for bb := fn.FirstBasicBlock(); !bb.IsNil(); bb = llvm.NextBasicBlock(bb) {
+			for inst := bb.FirstInstruction(); !inst.IsNil(); inst = llvm.NextInstruction(inst) {
+				if inst.InstructionOpcode() == llvm.Call && inst.IsTailCall() {
+					inst.SetTailCall(false)
+				}
+			}
+		}
+	}
+}
+
+// instructionAfter returns the first place after the definition of value
+// where an instruction can be inserted.
+func instructionAfter(value llvm.Value) llvm.Value {
+	next := llvm.NextInstruction(value)
+	for !next.IsAPHINode().IsNil() {
+		// PHI nodes are required to be at the start of the block.
+		next = llvm.NextInstruction(next)
+	}
+	return next
+}
+
+// Opcodes that go-llvm has no name for. See LLVMOpcode in llvm-c/Core.h.
+const (
+	opBr            llvm.Opcode = 2
+	opFence         llvm.Opcode = 55
+	opAtomicCmpXchg llvm.Opcode = 56
+	opAtomicRMW     llvm.Opcode = 57
+	opAddrSpaceCast llvm.Opcode = 60
+	opFNeg          llvm.Opcode = 66
+	opFreeze        llvm.Opcode = 68
+	opPtrToAddr     llvm.Opcode = 69
+)
+
+// What an instruction does with the values it is given.
+const (
+	slotUses   uint8 = iota // only uses them
+	slotFlow                // computes its result from them: a cast, a phi, ...
+	slotOrigin              // gets its result from memory or from a call
+)
+
+// gcSlotFunc decides which pointers of a function need a stack slot.
+//
+// The collector can only run inside a call that reaches it, a collecting
+// call. A pointer needs a slot if it is still in use when such a call is made
+// or when it returns: as an argument (a callee does not root its parameters,
+// the caller does), or after the call, anywhere the call can lead to.
+// Otherwise no collection can tell the difference.
+//
+// "In use" covers every value the pointer can be found in: the values computed
+// from it without going through memory or a call (interior pointers, casts,
+// phis, selects, fields of aggregates, the integer after a conversion and
+// whatever is computed from that, a comparison included). The search for what
+// a value in use is made of goes back to where its bits entered the function,
+// and that value gets the slot. It goes on past a conversion to a pointer and
+// past a phi in a loop, which get slots of their own, see passesThrough.
+//
+// The pointers that are looked at are not just the tracked ones but every
+// value that a load, a call, an integer conversion or a phi in a loop
+// produces: all the places where a pointer into the heap can enter the
+// function. Each is rooted where it is made.
+//
+// A pointer does not have to look like one. LLVM copies a small object (one or
+// two pointers, a string, an interface) as an integer of its size, and once
+// the variable it was copied to is gone that integer is the only thing that
+// has the pointers. So the integers of at least the size of a pointer that
+// loads produce are taken for possible pointers (see findCarriers). They get
+// a slot, as the integers they are (the collector reads the stack word by
+// word), on the same terms as pointers: if they, or anything computed from
+// them, are in use across a collecting call, whatever the use is. A comparison
+// after a collection, for one, would find a new object at the address of the
+// old one. Being passed to the collecting call itself does not count for an
+// integer, though: a function takes the integers it is given for integers.
+//
+// The pass runs before link time optimization, and it is the final code that
+// has to obey the rule, not the code seen here. Stores and calls keep their
+// order, so a pointer with a slot is in its slot before the call. What must
+// not happen is that LLVM carries a pointer without a slot across a collecting
+// call: by moving a load or a store past the call, or by turning memory that
+// holds the pointer during the call into a value. LLVM can do that only with
+// memory that, as far as it knows, no call reads or writes. So no such memory
+// may be on the heap, or hold a pointer into the heap while a collection runs:
+//
+//   - A new allocation that gets no slot is passed to exposeStackObjectName,
+//     like a stack object.
+//   - So is a stack variable that may hold such a pointer when a collection
+//     runs, as a pointer or as such an integer. It then stays in memory,
+//     where the collector finds it.
+//   - Globals with pointers have their address in the table of global roots.
+//   - No call stays marked 'tail' in a function that exposes part of its
+//     stack: LLVM takes such a call to leave the caller's stack alone.
+type gcSlotFunc struct {
+	pass *gcSlotPass
+
+	// The instructions in order. An instruction is known by its index.
+	insts      []llvm.Value
+	index      map[llvm.Value]int32
+	opcode     []llvm.Opcode
+	kind       []uint8
+	blockOf    []int32
+	blockStart []int32 // index of the first instruction, with one extra entry
+	preds      [][]int32
+	succs      [][]int32
+	inCycle    []bool // per block
+
+	// The operands that are instructions (-1 for the others) and, for a
+	// phi, the blocks they come from.
+	opStart  []int32
+	ops      []int32
+	opBlock  []int32
+	opInst   []int32 // the instruction an operand belongs to
+	useStart []int32
+	uses     []int32 // indices into ops
+
+	// collectBefore[i] is the number of collecting calls before instruction i.
+	collecting    []bool
+	collectBefore []int32
+	calls         []int32 // the collecting calls
+
+	// hasPointer says that the type of the value contains a pointer. intBits
+	// says that a pointer may sit in it as an integer, or in an integer field
+	// of it (see findCarriers). fromHere says that the pointer was not handed
+	// to the function by its caller: a load or a call made it, or it is
+	// computed from the result of one.
+	hasPointer []bool
+	intBits    []bool
+	fromHere   []bool
+
+	// sure says that an address is computed from the value: it holds
+	// a pointer whatever its type.
+	sure []bool
+
+	// boundary marks the values that may get a slot of their own. The search
+	// for what a pointer in use is made of stops at them, except where
+	// passesThrough says otherwise.
+	boundary []bool
+
+	// conservative is set for a function with something this analysis does
+	// not understand. It keeps every tracked pointer.
+	conservative bool
+
+	// variables are the stack variables that have to be exposed.
+	variables []llvm.Value
+
+	// derivedPhis remembers what selfDerived found.
+	derivedPhis map[int32]bool
+
+	stamp   []int32
+	stampID int32
+	stack   []int32
+}
+
+// gcSlot is a pointer that may get a slot.
+type gcSlot struct {
+	value llvm.Value // nil if it still has to be extracted from the aggregate
+	def   int32      // index of value, or -1
+	agg   int32      // index of the aggregate that value is a field of, or -1
+	path  []uint32   // which field
+	ints  bool       // the field is an integer
+}
+
+func (p *gcSlotPass) newSlotFunc(fn llvm.Value) *gcSlotFunc {
+	f := &gcSlotFunc{pass: p, index: map[llvm.Value]int32{}}
+
+	blockIndex := map[llvm.BasicBlock]int32{}
+	for bb := fn.FirstBasicBlock(); !bb.IsNil(); bb = llvm.NextBasicBlock(bb) {
+		blockIndex[bb] = int32(len(f.blockStart))
+		f.blockStart = append(f.blockStart, int32(len(f.insts)))
+		for inst := bb.FirstInstruction(); !inst.IsNil(); inst = llvm.NextInstruction(inst) {
+			f.index[inst] = int32(len(f.insts))
+			f.insts = append(f.insts, inst)
+			f.blockOf = append(f.blockOf, blockIndex[bb])
+		}
+	}
+	f.blockStart = append(f.blockStart, int32(len(f.insts)))
+	numBlocks := len(f.blockStart) - 1
+	f.preds = make([][]int32, numBlocks)
+	succs := make([][]int32, numBlocks)
+	for bb := fn.FirstBasicBlock(); !bb.IsNil(); bb = llvm.NextBasicBlock(bb) {
+		term := bb.LastInstruction()
+		from := blockIndex[bb]
+		for i := 0; i < term.SuccessorsCount(); i++ {
+			to := blockIndex[term.Successor(i)]
+			succs[from] = append(succs[from], to)
+			f.preds[to] = append(f.preds[to], from)
+		}
+	}
+	f.succs = succs
+	f.inCycle = blocksInCycles(succs)
+	f.stamp = make([]int32, numBlocks)
+
+	n := len(f.insts)
+	f.opcode = make([]llvm.Opcode, n)
+	f.kind = make([]uint8, n)
+	f.collecting = make([]bool, n)
+	f.collectBefore = make([]int32, n+1)
+	f.hasPointer = make([]bool, n)
+	f.intBits = make([]bool, n)
+	f.fromHere = make([]bool, n)
+	f.boundary = make([]bool, n)
+	f.opStart = make([]int32, n+1)
+	for i, inst := range f.insts {
+		op := inst.InstructionOpcode()
+		f.opcode[i] = op
+		f.opStart[i] = int32(len(f.ops))
+		numOperands := inst.OperandsCount()
+		for j := 0; j < numOperands; j++ {
+			operand := int32(-1)
+			if idx, ok := f.index[inst.Operand(j)]; ok {
+				operand = idx
+			}
+			f.ops = append(f.ops, operand)
+			f.opInst = append(f.opInst, int32(i))
+			block := int32(-1)
+			if op == llvm.PHI {
+				block = blockIndex[inst.IncomingBlock(j)]
+			}
+			f.opBlock = append(f.opBlock, block)
 		}
 
-		// The stack object has to outlive every call that this function
-		// makes, as it is what keeps the arguments of those calls alive. A
-		// tail call would give up the frame, and the stack object with it,
-		// before the callee has run.
-		for _, ret := range returns {
-			prev := llvm.PrevInstruction(ret)
-			if !prev.IsNil() && !prev.IsABitCastInst().IsNil() {
-				// A bitcast can appear before a tail call, so skip backwards more.
-				prev = llvm.PrevInstruction(prev)
+		typ := inst.Type()
+		switch typ.TypeKind() {
+		case llvm.VoidTypeKind, llvm.IntegerTypeKind, llvm.FloatTypeKind, llvm.DoubleTypeKind:
+		case llvm.PointerTypeKind, llvm.StructTypeKind, llvm.ArrayTypeKind:
+			f.hasPointer[i] = typeHasPointers(typ)
+		default:
+			// A vector, perhaps of pointers.
+			f.conservative = true
+			if typ.TypeKind() == llvm.VectorTypeKind && typ.ElementType().TypeKind() == llvm.PointerTypeKind {
+				f.hasPointer[i] = true
 			}
-			if !prev.IsNil() && !prev.IsACallInst().IsNil() {
-				prev.SetTailCall(false)
+		}
+
+		switch op {
+		case llvm.GetElementPtr, llvm.BitCast, opAddrSpaceCast, llvm.PtrToInt, opPtrToAddr,
+			llvm.IntToPtr, llvm.Trunc, llvm.ZExt, llvm.SExt, llvm.PHI, llvm.Select,
+			llvm.ExtractValue, llvm.InsertValue, llvm.ExtractElement, llvm.InsertElement,
+			llvm.ShuffleVector, opFreeze, llvm.Add, llvm.Sub, llvm.Mul, llvm.UDiv, llvm.SDiv,
+			llvm.URem, llvm.SRem, llvm.Shl, llvm.LShr, llvm.AShr, llvm.And, llvm.Or, llvm.Xor,
+			// The bits of an integer can go through a float and come back:
+			// a pointer of 32 bits fits a double exactly.
+			llvm.FAdd, llvm.FSub, llvm.FMul, llvm.FDiv, llvm.FRem, opFNeg,
+			llvm.FPToUI, llvm.FPToSI, llvm.UIToFP, llvm.SIToFP, llvm.FPTrunc, llvm.FPExt:
+			f.kind[i] = slotFlow
+		case llvm.Load, opAtomicRMW, opAtomicCmpXchg, llvm.VAArg:
+			f.kind[i] = slotOrigin
+		case llvm.Call:
+			f.kind[i] = slotOrigin
+			callee := inst.CalledValue().IsAFunction()
+			switch {
+			case callee.IsNil():
+				// A function pointer or inline assembly.
+				f.collecting[i] = true
+			case callee.IntrinsicID() != 0:
+				// Intrinsics do not call back into the program. One that
+				// may read memory and returns a value (a masked load or
+				// gather) brings that value in like a load.
+				f.kind[i] = slotFlow
+				if inst.Type().TypeKind() != llvm.VoidTypeKind {
+					if mem := callee.GetEnumFunctionAttribute(p.memoryKind); mem.IsNil() || mem.GetEnumValue() != 0 {
+						f.kind[i] = slotOrigin
+					}
+				}
+			default:
+				_, external := p.collectors[callee]
+				_, internal := p.trackFuncs[callee]
+				f.collecting[i] = external || internal
+				if !callee.GetEnumFunctionAttribute(p.twiceKind).IsNil() {
+					f.conservative = true
+				}
+			}
+			if !inst.GetCallSiteEnumAttribute(-1, p.twiceKind).IsNil() {
+				// Control can come back to this call from any later one.
+				f.conservative = true
+			}
+		case llvm.ICmp, llvm.FCmp,
+			llvm.Alloca, llvm.Store, opFence, llvm.Ret, opBr, llvm.Switch, llvm.IndirectBr,
+			llvm.Unreachable:
+			f.kind[i] = slotUses
+		default:
+			// An invoke, exception handling, something new.
+			f.conservative = true
+		}
+		f.collectBefore[i+1] = f.collectBefore[i]
+		if f.collecting[i] {
+			f.collectBefore[i+1]++
+			f.calls = append(f.calls, int32(i))
+		}
+	}
+	f.opStart[n] = int32(len(f.ops))
+
+	// The uses of every instruction.
+	f.useStart = make([]int32, n+1)
+	for _, operand := range f.ops {
+		if operand >= 0 {
+			f.useStart[operand+1]++
+		}
+	}
+	for i := 0; i < n; i++ {
+		f.useStart[i+1] += f.useStart[i]
+	}
+	f.uses = make([]int32, f.useStart[n])
+	fill := append([]int32(nil), f.useStart[:n]...)
+	for slot, operand := range f.ops {
+		if operand >= 0 {
+			f.uses[fill[operand]] = int32(slot)
+			fill[operand]++
+		}
+	}
+
+	f.findCarriers()
+	return f
+}
+
+// canCarry returns whether a value of this type has room for a pointer in an
+// integer.
+func (f *gcSlotFunc) canCarry(typ llvm.Type) bool {
+	switch typ.TypeKind() {
+	case llvm.IntegerTypeKind:
+		return typ.IntTypeWidth() >= f.pass.targetData.PointerSize()*8
+	case llvm.StructTypeKind:
+		for _, field := range typ.StructElementTypes() {
+			if f.canCarry(field) {
+				return true
+			}
+		}
+	case llvm.ArrayTypeKind:
+		return typ.ArrayLength() != 0 && f.canCarry(typ.ElementType())
+	case llvm.VectorTypeKind:
+		// LLVM vectorizes nothing before this pass, but a vector of
+		// pointers or of such integers is kept like an integer.
+		elem := typ.ElementType()
+		return elem.TypeKind() == llvm.PointerTypeKind || f.canCarry(elem)
+	}
+	return false
+}
+
+// wholeSlot returns whether a value of this type, which is neither a pointer
+// nor an aggregate, is kept in a slot as it is if it may have a pointer in its
+// bits: whether it has room for one.
+func (f *gcSlotFunc) wholeSlot(typ llvm.Type) bool {
+	switch typ.TypeKind() {
+	case llvm.IntegerTypeKind, llvm.FloatTypeKind, llvm.DoubleTypeKind, llvm.VectorTypeKind:
+		return f.pass.targetData.TypeStoreSize(typ) >= uint64(f.pass.targetData.PointerSize())
+	}
+	return false
+}
+
+// findCarriers finds the values that may have a pointer in their integer
+// bits (intBits), and the values computed from something that a load or
+// a call in this function made (fromHere).
+//
+// A pointer gets into an integer by a conversion, or as one of the integers
+// LLVM copies small objects with (one or two pointers, a string, an
+// interface). So every integer of at least the size of a pointer that a load
+// or an atomic operation produces may be one, also as a field of an
+// aggregate, unless the compiler marked the load as one of a Go value made of
+// integers, floats and booleans (llvmutil.NoPointerMDName; not a uintptr).
+// The compiler marks its own loads only, never C code's, and LLVM keeps
+// metadata it does not know only on a copy of the same load, which reads the
+// same Go value; it drops it from a load it changes or merges with another.
+// What a call returns is not taken for a pointer: the result types of
+// functions are those of the Go source, which LLVM does not change at the
+// levels TinyGo optimizes at (argument promotion runs only at O3). Whatever an
+// address is computed from is a pointer for sure, whatever its type and
+// wherever it comes from. And whatever is computed from a value that may have
+// a pointer in it, through any calculation, may have its bits too.
+//
+// What a slot cannot hold, and what Go code does not make:
+//   - A piece of a pointer narrower than a pointer: the collector reads whole
+//     words. Go takes the bits of a pointer apart only as a uintptr, which
+//     keeps nothing alive, so LLVM has no reason to make such pieces of
+//     a pointer that is still in use.
+//   - A float made from a pointer by a conversion rather than a bitcast: its
+//     bits are not those of the pointer. The search goes back through the
+//     conversion to the integer, but a phi in a loop that carries such
+//     a float into the next round holds only the float.
+//   - A mark on a load whose bits LLVM also uses as a pointer: its GVN can
+//     forward a marked integer load to a load of a pointer from the same
+//     address, keeping the mark. That needs memory that the program reads
+//     both as a Go integer and as a pointer, which only unsafe code does.
+func (f *gcSlotFunc) findCarriers() {
+	n := int32(len(f.insts))
+	f.sure = make([]bool, n)
+	sure := f.sure
+	f.stack = f.stack[:0]
+	mark := func(value int32) {
+		if value >= 0 && !sure[value] && f.insts[value].Type().TypeKind() != llvm.PointerTypeKind {
+			sure[value] = true
+			f.stack = append(f.stack, value)
+		}
+	}
+	for i := int32(0); i < n; i++ {
+		if f.opcode[i] == llvm.IntToPtr || f.isIntegerAddress(i) {
+			for slot := f.opStart[i]; slot < f.opStart[i+1]; slot++ {
+				mark(f.ops[slot])
+			}
+		}
+	}
+	for len(f.stack) != 0 {
+		value := f.stack[len(f.stack)-1]
+		f.stack = f.stack[:len(f.stack)-1]
+		if f.kind[value] != slotFlow {
+			continue
+		}
+		for slot := f.opStart[value]; slot < f.opStart[value+1]; slot++ {
+			if !f.isCallee(slot) {
+				mark(f.ops[slot])
 			}
 		}
 	}
 
+	for i := int32(0); i < n; i++ {
+		switch {
+		case sure[i], f.opcode[i] == llvm.PtrToInt, f.opcode[i] == opPtrToAddr:
+			f.intBits[i] = true
+		case f.kind[i] == slotOrigin && (f.opcode[i] != llvm.Call || f.isMemoryIntrinsic(i)):
+			f.intBits[i] = f.canCarry(f.insts[i].Type()) && !f.noPointers(i)
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for i := int32(0); i < n; i++ {
+			if !f.fromHere[i] {
+				here := f.kind[i] == slotOrigin
+				if f.kind[i] == slotFlow {
+					for slot := f.opStart[i]; slot < f.opStart[i+1]; slot++ {
+						if operand := f.ops[slot]; operand >= 0 && f.fromHere[operand] {
+							here = true
+						}
+					}
+				}
+				if here {
+					f.fromHere[i] = true
+					changed = true
+				}
+			}
+			if f.intBits[i] || f.kind[i] != slotFlow || f.insts[i].Type().TypeKind() == llvm.PointerTypeKind {
+				// A pointer again (inttoptr, getelementptr) is followed as one.
+				continue
+			}
+			for slot := f.opStart[i]; slot < f.opStart[i+1]; slot++ {
+				if operand := f.ops[slot]; operand >= 0 && f.intBits[operand] && f.bitsFlow(slot) {
+					f.intBits[i] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+}
+
+// bitsFlow returns whether the bits of the operand in this slot can be found
+// in the result of the instruction it belongs to. All operands of a flow
+// instruction count, except the callee, the condition of a select (it only
+// chooses), and the distance of a shift.
+func (f *gcSlotFunc) bitsFlow(slot int32) bool {
+	user := f.opInst[slot]
+	switch f.opcode[user] {
+	case llvm.Select:
+		return slot != f.opStart[user]
+	case llvm.Shl, llvm.LShr, llvm.AShr:
+		return slot == f.opStart[user]
+	}
+	return !f.isCallee(slot)
+}
+
+// noPointers returns whether the instruction is a load that the front end
+// marked as one of a value of a Go type without pointers.
+func (f *gcSlotFunc) noPointers(i int32) bool {
+	return f.opcode[i] == llvm.Load && !f.insts[i].Metadata(f.pass.noPointerKind).IsNil()
+}
+
+// isIntegerAddress returns whether the instruction computes an address from
+// integers alone, the other way to write an inttoptr.
+func (f *gcSlotFunc) isIntegerAddress(i int32) bool {
+	return f.opcode[i] == llvm.GetElementPtr && f.insts[i].Operand(0).IsNull()
+}
+
+// isSlotKind returns whether the instruction is one that may get a slot: one
+// that brings a value into the function (a load, a call, an atomic
+// operation), a conversion to a pointer, or a phi in a loop, whose value can
+// outlive the slot of the value that went in, which is overwritten on the way
+// round.
+func (f *gcSlotFunc) isSlotKind(i int32) bool {
+	return f.kind[i] == slotOrigin || f.opcode[i] == llvm.IntToPtr || f.isCyclicPhi(i)
+}
+
+// isCyclicPhi returns whether the instruction is a phi in a loop.
+func (f *gcSlotFunc) isCyclicPhi(i int32) bool {
+	return f.opcode[i] == llvm.PHI && f.inCycle[f.blockOf[i]]
+}
+
+// passesThrough returns whether the search for what a pointer in use is made
+// of goes on past user, which has a slot: past any such value that a load or
+// a call did not make (a conversion to a pointer, a phi, a select). Its value
+// may point past the end of the object it was computed from (a pointer that
+// steps past the end of an array, an address computed in integers), and then
+// only the slot of what it was computed from keeps the object. So the search
+// goes on as for a value that is chosen into the slot (see keepsValue), and
+// what an address is computed from on the way is needed itself. A phi in
+// a loop that steps through an object needs what it starts from as well, see
+// selfDerived.
+func (f *gcSlotFunc) passesThrough(user int32) bool {
+	return f.kind[user] == slotFlow
+}
+
+// operandsNeeded returns whether what a value with a slot that the search
+// passes through is made of is needed itself, rather than held by that slot:
+// when the value changes what goes into it (see keepsValue: a tracked
+// intrinsic, say), or is a phi in a loop that steps through an object.
+func (f *gcSlotFunc) operandsNeeded(user int32) bool {
+	return !f.keepsValue(user) || f.isCyclicPhi(user) && f.selfDerived(user)
+}
+
+// selfDerived returns whether a phi in a loop is computed from its own value
+// with an address computed on the way: a pointer that steps through an
+// object. Its value can then point past the end of the object it started in,
+// where its slot no longer keeps that object, so the values it starts from
+// need slots of their own, even those that a load or a call made.
+//
+// Only steps that the function computes itself are seen. A pointer that
+// a callee computes from the loop pointer (p = step(p)), or that comes back
+// from memory (a variable a closure captured, for one), is taken to point
+// into its object or just past its data, as the rules of package unsafe
+// require of every pointer; the object's header, which follows its data,
+// still lies there. The same goes for a pointer that a loop phi carries from
+// one round into the next. TinyGo's original pass kept every allocation in
+// a slot for the whole function, so code that breaks those rules could get
+// away with it there and not here.
+func (f *gcSlotFunc) selfDerived(phi int32) bool {
+	if result, ok := f.derivedPhis[phi]; ok {
+		return result
+	}
+	type item struct {
+		value   int32
+		derived bool // an address was computed on the way
+	}
+	seen := map[item]struct{}{}
+	var stack []item
+	push := func(user int32, derived bool) {
+		for slot := f.opStart[user]; slot < f.opStart[user+1]; slot++ {
+			if operand := f.ops[slot]; operand >= 0 && f.bitsFlow(slot) && (f.hasPointer[operand] || f.intBits[operand]) {
+				it := item{operand, derived}
+				if _, ok := seen[it]; !ok {
+					seen[it] = struct{}{}
+					stack = append(stack, it)
+				}
+			}
+		}
+	}
+	push(phi, false)
+	result := false
+	for len(stack) != 0 && !result {
+		it := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		switch {
+		case it.value == phi:
+			result = it.derived
+		case f.kind[it.value] == slotFlow:
+			push(it.value, it.derived || !f.keepsValue(it.value))
+		}
+	}
+	if f.derivedPhis == nil {
+		f.derivedPhis = map[int32]bool{}
+	}
+	f.derivedPhis[phi] = result
+	return result
+}
+
+// keepsValue returns whether the instruction passes a value on without
+// computing an address from it: a cast, a choice (a phi, a select), or
+// putting the value into an aggregate or taking it out. A getelementptr only
+// counts if all its offsets are zero. What a slot holds that way is the value
+// itself.
+func (f *gcSlotFunc) keepsValue(i int32) bool {
+	switch f.opcode[i] {
+	case llvm.PHI, llvm.Select, llvm.BitCast, opAddrSpaceCast, opFreeze, llvm.ExtractValue,
+		llvm.InsertValue, llvm.Trunc, llvm.ZExt, llvm.SExt, llvm.PtrToInt, opPtrToAddr, llvm.IntToPtr:
+		return true
+	case llvm.GetElementPtr:
+		inst := f.insts[i]
+		for j := 1; j < inst.OperandsCount(); j++ {
+			offset := inst.Operand(j)
+			if offset.IsAConstantInt().IsNil() || offset.ZExtValue() != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// blocksInCycles returns which blocks lie on a cycle, see blockInCycle.
+func blocksInCycles(succs [][]int32) []bool {
+	// Tarjan's algorithm for strongly connected components, without recursion.
+	n := len(succs)
+	inCycle := make([]bool, n)
+	order := make([]int32, n) // 0 means not visited yet
+	low := make([]int32, n)
+	onStack := make([]bool, n)
+	var stack []int32
+	type frame struct{ block, next int32 }
+	var frames []frame
+	counter := int32(0)
+	for start := range succs {
+		if order[start] != 0 {
+			continue
+		}
+		frames = append(frames, frame{int32(start), 0})
+		for len(frames) != 0 {
+			fr := &frames[len(frames)-1]
+			b := fr.block
+			if fr.next == 0 {
+				counter++
+				order[b] = counter
+				low[b] = counter
+				stack = append(stack, b)
+				onStack[b] = true
+			}
+			if int(fr.next) < len(succs[b]) {
+				s := succs[b][fr.next]
+				fr.next++
+				if s == b {
+					inCycle[b] = true
+				}
+				if order[s] == 0 {
+					frames = append(frames, frame{s, 0})
+				} else if onStack[s] && order[s] < low[b] {
+					low[b] = order[s]
+				}
+				continue
+			}
+			frames = frames[:len(frames)-1]
+			if len(frames) != 0 {
+				parent := frames[len(frames)-1].block
+				if low[b] < low[parent] {
+					low[parent] = low[b]
+				}
+			}
+			if low[b] == order[b] {
+				// b is the root of a component.
+				size := 0
+				for i := len(stack) - 1; ; i-- {
+					size++
+					if stack[i] == b {
+						break
+					}
+				}
+				for i := 0; i < size; i++ {
+					member := stack[len(stack)-1]
+					stack = stack[:len(stack)-1]
+					onStack[member] = false
+					if size > 1 {
+						inCycle[member] = true
+					}
+				}
+			}
+		}
+	}
+	return inCycle
+}
+
+// carries returns whether the pointer in operand, which user takes in this
+// slot, can end up in user.
+func (f *gcSlotFunc) carries(operand, user, slot int32) bool {
+	if f.kind[user] != slotFlow || !f.bitsFlow(slot) {
+		return false
+	}
+	if !f.hasPointer[operand] && !f.intBits[operand] {
+		return false
+	}
+	// A value without pointers only carries one as an integer.
+	return f.hasPointer[user] || f.intBits[user]
+}
+
+// isCallee returns whether the operand in this slot is the function that is
+// called. That is never a pointer into the heap.
+func (f *gcSlotFunc) isCallee(slot int32) bool {
+	user := f.opInst[slot]
+	return f.opcode[user] == llvm.Call && slot == f.opStart[user+1]-1
+}
+
+// liveAtCollection returns whether value is in use when a collecting call is
+// made or when it returns, looking only at the uses that skip does not reject.
+// With args set, being an argument of the collecting call counts too: the
+// callee does not root its parameters, the caller does. That goes for
+// pointers, not for integers: an integer that a function is given is an
+// integer to it.
+func (f *gcSlotFunc) liveAtCollection(value int32, skip func(user int32) bool, args bool) bool {
+	f.stampID++
+	f.stack = f.stack[:0]
+	defBlock := f.blockOf[value]
+	// liveOut says that value is needed at the end of block. It returns
+	// whether a collecting call lies between the definition and that point,
+	// and otherwise remembers to look at the blocks before it.
+	liveOut := func(block int32) bool {
+		if f.stamp[block] == f.stampID {
+			return false
+		}
+		f.stamp[block] = f.stampID
+		end := f.blockStart[block+1]
+		if block == defBlock {
+			return f.collectBefore[end] != f.collectBefore[value+1]
+		}
+		if f.collectBefore[end] != f.collectBefore[f.blockStart[block]] {
+			return true
+		}
+		f.stack = append(f.stack, block)
+		return false
+	}
+	for u := f.useStart[value]; u < f.useStart[value+1]; u++ {
+		slot := f.uses[u]
+		user := f.opInst[slot]
+		if skip != nil && skip(user) {
+			continue
+		}
+		if f.opcode[user] == llvm.ExtractValue && !f.hasPointer[user] && !f.intBits[user] {
+			// This takes a field without a pointer out of an aggregate.
+			continue
+		}
+		if f.opcode[user] == llvm.PHI {
+			// The phi uses the value at the end of the block it comes from.
+			if liveOut(f.opBlock[slot]) {
+				return true
+			}
+			continue
+		}
+		if args && f.collecting[user] && !f.isCallee(slot) {
+			return true
+		}
+		block := f.blockOf[user]
+		if block == defBlock && user > value {
+			if f.collectBefore[user] != f.collectBefore[value+1] {
+				return true
+			}
+			continue
+		}
+		if f.collectBefore[user] != f.collectBefore[f.blockStart[block]] {
+			return true
+		}
+		f.stack = append(f.stack, block)
+	}
+	// The value is needed at the start of the blocks on the stack, so at the
+	// end of all blocks before them.
+	for len(f.stack) != 0 {
+		block := f.stack[len(f.stack)-1]
+		f.stack = f.stack[:len(f.stack)-1]
+		for _, pred := range f.preds[block] {
+			if liveOut(pred) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// source follows a pointer back through the instructions that only pass it
+// on: casts, and putting it into an aggregate and taking it out again. It
+// returns the instruction that made the pointer (def), or the aggregate that
+// the pointer is a field of and which field (agg and path). Both are -1 if
+// nothing in this function made the pointer: it is a parameter or a constant,
+// or a field of one.
+func (f *gcSlotFunc) source(ptr llvm.Value) (def, agg int32, path []uint32) {
+	for {
+		idx, ok := f.index[ptr]
+		if !ok {
+			return -1, -1, nil
+		}
+		switch f.opcode[idx] {
+		case llvm.BitCast:
+			ptr = ptr.Operand(0)
+		case llvm.GetElementPtr:
+			for i := 1; i < ptr.OperandsCount(); i++ {
+				offset := ptr.Operand(i)
+				if offset.IsAConstantInt().IsNil() || offset.ZExtValue() != 0 {
+					return idx, -1, nil
+				}
+			}
+			ptr = ptr.Operand(0)
+		case llvm.ExtractValue:
+			path = ptr.Indices()
+			from := ptr.Operand(0)
+			for {
+				agg, ok := f.index[from]
+				if !ok {
+					return -1, -1, nil
+				}
+				if f.opcode[agg] == llvm.ExtractValue {
+					path = append(from.Indices(), path...)
+					from = from.Operand(0)
+					continue
+				}
+				if f.opcode[agg] != llvm.InsertValue {
+					return -1, agg, path
+				}
+				inserted := from.Indices()
+				if len(inserted) > len(path) || !slices.Equal(inserted, path[:len(inserted)]) {
+					// Another field was inserted.
+					from = from.Operand(0)
+					continue
+				}
+				// This field, or the aggregate it is in, was inserted here.
+				from = from.Operand(1)
+				path = path[len(inserted):]
+				if len(path) == 0 {
+					break
+				}
+			}
+			ptr = from
+		default:
+			return idx, -1, nil
+		}
+	}
+}
+
+// carrierPaths appends the index path of every field in a value of type typ
+// that is not a pointer but may hold one: an integer or a vector with room
+// for a pointer, and with floats set (the value is one an address is computed
+// from, see sure) a float or a double as well. LLVM never makes a float of
+// a pointer that Go code copies, so only an address computed from one makes
+// it hold a pointer.
+func (f *gcSlotFunc) carrierPaths(typ llvm.Type, prefix []uint32, paths [][]uint32, floats bool) [][]uint32 {
+	switch typ.TypeKind() {
+	case llvm.IntegerTypeKind, llvm.VectorTypeKind, llvm.FloatTypeKind, llvm.DoubleTypeKind:
+		if f.fieldCarries(typ, floats) {
+			paths = append(paths, append([]uint32(nil), prefix...))
+		}
+	case llvm.StructTypeKind:
+		for i, field := range typ.StructElementTypes() {
+			paths = f.carrierPaths(field, append(prefix, uint32(i)), paths, floats)
+		}
+	case llvm.ArrayTypeKind:
+		if elem := typ.ElementType(); f.canCarry(elem) || f.fieldCarries(elem, floats) {
+			for i := 0; i < typ.ArrayLength(); i++ {
+				paths = f.carrierPaths(elem, append(prefix, uint32(i)), paths, floats)
+			}
+		}
+	}
+	return paths
+}
+
+// fieldCarries returns whether a field of this scalar or vector type may hold
+// a pointer, see carrierPaths.
+func (f *gcSlotFunc) fieldCarries(typ llvm.Type, floats bool) bool {
+	switch typ.TypeKind() {
+	case llvm.IntegerTypeKind:
+		return f.canCarry(typ)
+	case llvm.VectorTypeKind:
+		return f.canCarry(typ) || floats && f.wholeSlot(typ)
+	case llvm.FloatTypeKind, llvm.DoubleTypeKind:
+		return floats && f.wholeSlot(typ)
+	}
+	return false
+}
+
+// pathsOverlap returns whether one field contains the other.
+func pathsOverlap(a, b []uint32) bool {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
 	return true
+}
+
+// pointerPaths appends the index path of every pointer in a value of type typ.
+func pointerPaths(typ llvm.Type, prefix []uint32, paths [][]uint32) [][]uint32 {
+	switch typ.TypeKind() {
+	case llvm.PointerTypeKind:
+		paths = append(paths, append([]uint32(nil), prefix...))
+	case llvm.StructTypeKind:
+		for i, field := range typ.StructElementTypes() {
+			paths = pointerPaths(field, append(prefix, uint32(i)), paths)
+		}
+	case llvm.ArrayTypeKind:
+		if typeHasPointers(typ.ElementType()) {
+			for i := 0; i < typ.ArrayLength(); i++ {
+				paths = pointerPaths(typ.ElementType(), append(prefix, uint32(i)), paths)
+			}
+		}
+	case llvm.VectorTypeKind:
+		// A vector of pointers is kept whole.
+		if typeHasPointers(typ) {
+			paths = append(paths, append([]uint32(nil), prefix...))
+		}
+	}
+	return paths
+}
+
+// isMemoryIntrinsic returns whether the instruction is a call of an intrinsic
+// that reads memory and returns what it read, such as a masked load.
+func (f *gcSlotFunc) isMemoryIntrinsic(i int32) bool {
+	if f.opcode[i] != llvm.Call || f.kind[i] != slotOrigin {
+		return false
+	}
+	callee := f.insts[i].CalledValue().IsAFunction()
+	return !callee.IsNil() && callee.IntrinsicID() != 0
+}
+
+// liveSlots returns the pointers that need a slot. It looks at the tracked
+// pointers and at every other value that brings a pointer into the function,
+// and takes each of them where it is made: several tracked pointers are often
+// the same field of the result of one call.
+func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
+	f.findVariables()
+	if f.conservative {
+		// Every tracked pointer, and every other value that may bring
+		// a pointer into the function, in use at a collecting call or not.
+		have := make(map[llvm.Value]struct{}, len(tracked))
+		for _, ptr := range tracked {
+			have[ptr] = struct{}{}
+		}
+		add := func(value llvm.Value) {
+			if _, ok := have[value]; !ok {
+				have[value] = struct{}{}
+				tracked = append(tracked, value)
+			}
+		}
+		for i, inst := range f.insts {
+			if !f.isSlotKind(int32(i)) || !f.hasPointer[i] && !f.intBits[i] {
+				continue
+			}
+			typ := inst.Type()
+			switch typ.TypeKind() {
+			case llvm.PointerTypeKind:
+				add(inst)
+			case llvm.StructTypeKind, llvm.ArrayTypeKind:
+				for _, path := range pointerPaths(typ, nil, nil) {
+					add(f.extractField(int32(i), path))
+				}
+				if f.intBits[i] {
+					for _, path := range f.carrierPaths(typ, nil, nil, f.sure[i]) {
+						add(f.extractField(int32(i), path))
+					}
+				}
+			default:
+				if f.wholeSlot(typ) {
+					add(inst)
+				}
+			}
+		}
+		return tracked
+	}
+
+	var slots []gcSlot
+	isSlot := make([]bool, len(f.insts))
+	isField := map[string]struct{}{}
+	addSlot := func(def, agg int32, path []uint32, ints bool) {
+		switch {
+		case def >= 0:
+			if isSlot[def] {
+				return
+			}
+			switch f.opcode[def] {
+			case llvm.GetElementPtr, llvm.Alloca:
+				// An interior pointer is in use as long as the pointer it is
+				// computed from, and the stack is scanned as it is.
+				return
+			}
+			isSlot[def] = true
+			f.boundary[def] = true
+			slots = append(slots, gcSlot{value: f.insts[def], def: def, agg: -1})
+		case agg >= 0:
+			key := fmt.Sprint(agg, path)
+			if _, ok := isField[key]; ok {
+				return
+			}
+			isField[key] = struct{}{}
+			slots = append(slots, gcSlot{def: -1, agg: agg, path: path, ints: ints})
+		}
+	}
+	for _, ptr := range tracked {
+		def, agg, path := f.source(ptr)
+		addSlot(def, agg, path, false)
+	}
+	for i, inst := range f.insts {
+		ints := f.intBits[i]
+		if !f.hasPointer[i] && !ints || !f.isSlotKind(int32(i)) {
+			continue
+		}
+		typ := inst.Type()
+		switch typ.TypeKind() {
+		case llvm.PointerTypeKind:
+			addSlot(int32(i), -1, nil, false)
+			continue
+		case llvm.StructTypeKind, llvm.ArrayTypeKind:
+		default:
+			// An integer, or another value that an address is computed
+			// from. The slot takes it as it is: the collector reads the
+			// stack word by word.
+			if f.wholeSlot(typ) {
+				addSlot(int32(i), -1, nil, true)
+			}
+			continue
+		}
+		for _, path := range pointerPaths(typ, nil, nil) {
+			addSlot(-1, int32(i), path, false)
+		}
+		if ints {
+			for _, path := range f.carrierPaths(typ, nil, nil, f.sure[i]) {
+				addSlot(-1, int32(i), path, true)
+			}
+		}
+		if f.opcode[i] == llvm.PHI {
+			f.boundary[i] = true
+		}
+	}
+
+	// needed[v] says that v, or something computed from v up to the next
+	// value with a slot of its own, is in use at a collecting call.
+	//
+	// chosen[v] says that v goes unchanged (see keepsValue) into a value with
+	// a slot that the search passes through (see passesThrough). That slot
+	// holds v, so v needs no slot for that, but what an address is computed
+	// from on the way there is needed.
+	n := int32(len(f.insts))
+	needed := make([]bool, n)
+	chosen := make([]bool, n)
+	var worklist []int32 // a value, or -1-value for one that is chosen
+	for i := int32(0); i < n; i++ {
+		if (f.hasPointer[i] || f.intBits[i]) && f.liveAtCollection(i, nil, f.hasPointer[i]) {
+			needed[i] = true
+			worklist = append(worklist, i)
+		}
+	}
+	push := func(value int32, asChosen bool) {
+		switch {
+		case needed[value]:
+		case !asChosen:
+			needed[value] = true
+			worklist = append(worklist, value)
+		case !chosen[value]:
+			chosen[value] = true
+			worklist = append(worklist, -1-value)
+		}
+	}
+	for len(worklist) != 0 {
+		user := worklist[len(worklist)-1]
+		worklist = worklist[:len(worklist)-1]
+		isChosen := user < 0
+		if isChosen {
+			user = -1 - user
+			if needed[user] {
+				// Followed as needed instead.
+				continue
+			}
+		}
+		var asChosen bool
+		switch {
+		case isChosen:
+			asChosen = f.keepsValue(user)
+		case f.boundary[user]:
+			if !f.passesThrough(user) {
+				// The slot of user roots what is used through it.
+				continue
+			}
+			// The slot of user holds what goes into it unchanged, unless
+			// user changes it or steps through an object.
+			asChosen = !f.operandsNeeded(user)
+		}
+		for slot := f.opStart[user]; slot < f.opStart[user+1]; slot++ {
+			operand := f.ops[slot]
+			if operand < 0 || !f.carries(operand, user, slot) {
+				continue
+			}
+			if asChosen && f.kind[operand] == slotOrigin {
+				// The slot user's value goes into holds it.
+				continue
+			}
+			push(operand, asChosen)
+		}
+	}
+
+	// The same for one field of an aggregate: the other fields that are
+	// taken out of it do not count.
+	paths := map[int32][]uint32{}
+	otherField := func(agg int32, path []uint32) func(user int32) bool {
+		return func(user int32) bool {
+			if f.opcode[user] != llvm.ExtractValue || f.ops[f.opStart[user]] != agg {
+				return false
+			}
+			userPath, ok := paths[user]
+			if !ok {
+				userPath = f.insts[user].Indices()
+				paths[user] = userPath
+			}
+			return !pathsOverlap(userPath, path)
+		}
+	}
+	fieldNeeded := func(agg int32, path []uint32, ints bool) bool {
+		if ints && !f.intBits[agg] {
+			return false
+		}
+		skip := otherField(agg, path)
+		for u := f.useStart[agg]; u < f.useStart[agg+1]; u++ {
+			slot := f.uses[u]
+			user := f.opInst[slot]
+			if skip(user) {
+				continue
+			}
+			if f.boundary[user] && !(needed[user] && f.passesThrough(user) && f.operandsNeeded(user)) {
+				// Its slot roots the field. A value with a slot that the
+				// search passes through holds it as well, see chosen; but
+				// a phi in a loop that steps through an object needs what it
+				// starts from.
+				continue
+			}
+			if needed[user] && f.carries(agg, user, slot) {
+				return true
+			}
+		}
+		// An integer field that is passed to a collecting call is an integer
+		// to the callee.
+		return f.liveAtCollection(agg, skip, !ints)
+	}
+
+	var live []llvm.Value
+	for _, slot := range slots {
+		switch {
+		case slot.def >= 0:
+			if needed[slot.def] {
+				live = append(live, slot.value)
+			}
+		case fieldNeeded(slot.agg, slot.path, slot.ints):
+			live = append(live, f.extractField(slot.agg, slot.path))
+		}
+	}
+	if GCSlotCheck != nil {
+		f.checkSlots(live)
+	}
+	return live
+}
+
+// extractField returns the pointer that is the given field of an aggregate,
+// available before anything can collect.
+func (f *gcSlotFunc) extractField(agg int32, path []uint32) llvm.Value {
+	// It is often there already.
+	for i := agg + 1; i < f.blockStart[f.blockOf[agg]+1] && !f.collecting[i]; i++ {
+		if f.opcode[i] == llvm.ExtractValue && f.ops[f.opStart[i]] == agg && slices.Equal(f.insts[i].Indices(), path) {
+			return f.insts[i]
+		}
+	}
+	f.pass.builder.SetInsertPointBefore(instructionAfter(f.insts[agg]))
+	value := f.insts[agg]
+	for _, index := range path {
+		value = f.pass.builder.CreateExtractValue(value, int(index), "")
+	}
+	return value
+}
+
+// expose passes to exposeStackObjectName what LLVM has to take for memory
+// that every call may read and write: the new allocations that have no slot,
+// and the stack variables that may hold a pointer. It returns whether that
+// includes a stack variable.
+func (f *gcSlotFunc) expose(slots []llvm.Value) bool {
+	p := f.pass
+	hasSlot := make(map[llvm.Value]struct{}, len(slots))
+	for _, ptr := range slots {
+		hasSlot[ptr] = struct{}{}
+	}
+	exposedAlloca := false
+	for i, inst := range f.insts {
+		switch f.opcode[i] {
+		case llvm.Call:
+			// LLVM knows that the result of a function with a noalias result
+			// is a new object that nothing else knows.
+			if f.kind[i] != slotOrigin || inst.Type().TypeKind() != llvm.PointerTypeKind {
+				continue
+			}
+			if _, ok := hasSlot[inst]; ok || f.useStart[i] == f.useStart[i+1] {
+				continue
+			}
+			noalias := !inst.GetCallSiteEnumAttribute(0, p.noAliasKind).IsNil()
+			if callee := inst.CalledValue().IsAFunction(); !callee.IsNil() {
+				noalias = noalias || !callee.GetEnumAttributeAtIndex(0, p.noAliasKind).IsNil()
+			}
+			if noalias {
+				p.builder.SetInsertPointBefore(llvm.NextInstruction(inst))
+				p.builder.CreateCall(p.exposeType, p.expose, []llvm.Value{inst}, "")
+			}
+		}
+	}
+	for _, variable := range f.variables {
+		p.builder.SetInsertPointBefore(llvm.NextInstruction(variable))
+		p.builder.CreateCall(p.exposeType, p.expose, []llvm.Value{variable}, "")
+		exposedAlloca = true
+	}
+	return exposedAlloca
+}
+
+// findVariables collects the stack variables that have to be exposed.
+func (f *gcSlotFunc) findVariables() {
+	for i, inst := range f.insts {
+		if f.opcode[i] == llvm.Alloca && f.holdsPointerAtCollection(inst) {
+			f.variables = append(f.variables, inst)
+		}
+	}
+}
+
+// holdsPointerAtCollection returns whether a stack variable may hold a pointer
+// into the heap while a collection runs, with the variable read afterwards:
+// whether a collecting call can come after something that may write such a
+// pointer to the variable and before or at a use of the variable.
+func (f *gcSlotFunc) holdsPointerAtCollection(alloca llvm.Value) bool {
+	var writes, uses []int32
+	if !f.stackUses(alloca, &writes, &uses) {
+		// Something this pass cannot follow has the address.
+		return true
+	}
+	if len(writes) == 0 {
+		return false
+	}
+
+	// The blocks that come after a write, and those from which a use can
+	// still be reached.
+	numBlocks := len(f.preds)
+	const (
+		afterWrite = 1 << iota
+		beforeUse
+	)
+	state := make([]uint8, numBlocks)
+	firstWrite := map[int32]int32{}
+	lastUse := map[int32]int32{}
+	f.stack = f.stack[:0]
+	for _, w := range writes {
+		block := f.blockOf[w]
+		if first, ok := firstWrite[block]; !ok || w < first {
+			firstWrite[block] = w
+		}
+		f.stack = append(f.stack, block)
+	}
+	for len(f.stack) != 0 {
+		block := f.stack[len(f.stack)-1]
+		f.stack = f.stack[:len(f.stack)-1]
+		for _, succ := range f.succs[block] {
+			if state[succ]&afterWrite == 0 {
+				state[succ] |= afterWrite
+				f.stack = append(f.stack, succ)
+			}
+		}
+	}
+	for _, u := range uses {
+		block := f.blockOf[u]
+		if last, ok := lastUse[block]; !ok || u > last {
+			lastUse[block] = u
+		}
+		f.stack = append(f.stack, block)
+	}
+	for len(f.stack) != 0 {
+		block := f.stack[len(f.stack)-1]
+		f.stack = f.stack[:len(f.stack)-1]
+		for _, pred := range f.preds[block] {
+			if state[pred]&beforeUse == 0 {
+				state[pred] |= beforeUse
+				f.stack = append(f.stack, pred)
+			}
+		}
+	}
+	isWrite := map[int32]struct{}{}
+	for _, w := range writes {
+		isWrite[w] = struct{}{}
+	}
+	isUse := map[int32]struct{}{}
+	for _, u := range uses {
+		isUse[u] = struct{}{}
+	}
+	for _, call := range f.calls {
+		if _, ok := isWrite[call]; ok {
+			// The callee may write to the variable and then collect.
+			return true
+		}
+		block := f.blockOf[call]
+		written := state[block]&afterWrite != 0
+		if first, ok := firstWrite[block]; ok && first < call {
+			written = true
+		}
+		if !written {
+			continue
+		}
+		_, used := isUse[call]
+		if last, ok := lastUse[block]; ok && last > call {
+			used = true
+		}
+		if used || state[block]&beforeUse != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// stackUses collects the instructions that use the memory at addr, the
+// address of a stack variable or of a part of one, and those among them that
+// may write a pointer into the heap there. It returns false if the address
+// gets somewhere this pass cannot follow.
+func (f *gcSlotFunc) stackUses(addr llvm.Value, writes, uses *[]int32) bool {
+	p := f.pass
+	for use := addr.FirstUse(); !use.IsNil(); use = use.NextUse() {
+		user := use.User()
+		idx, ok := f.index[user]
+		if !ok {
+			return false
+		}
+		switch f.opcode[idx] {
+		case llvm.ICmp:
+		case llvm.Load:
+			*uses = append(*uses, idx)
+		case llvm.Store:
+			if user.Operand(0) == addr {
+				// The address itself is stored somewhere.
+				return false
+			}
+			*uses = append(*uses, idx)
+			if f.mayBePointer(user.Operand(0)) {
+				*writes = append(*writes, idx)
+			}
+		case llvm.GetElementPtr, llvm.BitCast:
+			if user.Operand(0) != addr || !f.stackUses(user, writes, uses) {
+				return false
+			}
+		case llvm.Call:
+			callee := user.CalledValue()
+			if callee == addr {
+				return false
+			}
+			numArgs := user.OperandsCount() - 1
+			if fn := callee.IsAFunction(); !fn.IsNil() && fn.IntrinsicID() != 0 {
+				switch {
+				case strings.HasPrefix(fn.Name(), "llvm.lifetime."):
+				case !user.IsAMemSetInst().IsNil():
+					*uses = append(*uses, idx)
+				case !user.IsAMemCpyInst().IsNil(), !user.IsAMemMoveInst().IsNil():
+					*uses = append(*uses, idx)
+					if user.Operand(0) != addr {
+						// Only copied from.
+						break
+					}
+					source := stripPointerCasts(user.Operand(1))
+					if source.IsAGlobalVariable().IsNil() || !source.IsGlobalConstant() {
+						*writes = append(*writes, idx)
+					}
+				default:
+					return false
+				}
+				continue
+			}
+			*uses = append(*uses, idx)
+			for i := 0; i < numArgs; i++ {
+				if user.Operand(i) != addr {
+					continue
+				}
+				// A function may write to the variable or keep its address,
+				// unless it is known to do neither.
+				attrs := func(kind uint) (attr llvm.Attribute) {
+					attr = user.GetCallSiteEnumAttribute(i+1, kind)
+					if fn := callee.IsAFunction(); attr.IsNil() && !fn.IsNil() && i < fn.ParamsCount() {
+						attr = fn.GetEnumAttributeAtIndex(i+1, kind)
+					}
+					return
+				}
+				if !llvmutil.IsNoCapture(attrs(p.noCaptureKind)) {
+					return false
+				}
+				if attrs(p.readOnlyKind).IsNil() && attrs(p.readNoneKind).IsNil() {
+					*writes = append(*writes, idx)
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// mayBePointer returns whether value, which is stored to a stack variable,
+// may be or contain a pointer into the heap.
+func (f *gcSlotFunc) mayBePointer(value llvm.Value) bool {
+	if !value.IsAConstant().IsNil() {
+		// Null, or the address of a global.
+		return false
+	}
+	idx, ok := f.index[value]
+	if !ok || !f.fromHere[idx] {
+		// A parameter, or computed from parameters: the caller roots those.
+		return false
+	}
+	typ := value.Type()
+	if typeHasPointers(typ) {
+		return true
+	}
+	if f.pass.targetData.TypeStoreSize(typ) < uint64(f.pass.targetData.PointerSize()) {
+		return false
+	}
+	// LLVM copies small objects as integers.
+	switch f.opcode[idx] {
+	case llvm.Load:
+		return !f.noPointers(idx) || f.intBits[idx]
+	case opAtomicRMW, opAtomicCmpXchg, llvm.VAArg:
+		return true
+	}
+	return f.conservative || f.intBits[idx]
 }
 
 // exposeStackObjectName is the function that every function with a stack

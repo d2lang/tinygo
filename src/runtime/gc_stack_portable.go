@@ -20,8 +20,9 @@ func gcMarkReachable() {
 //     though it may be referenced it will not be scanned by default.
 //
 // WebAssembly keeps local variables where nothing can read them, so the
-// compiler makes every function store the pointers it holds in a stack object:
-// memory on these stacks, which is scanned here like the rest of them.
+// compiler makes every function store the pointers that it still needs when
+// a collection can run in a stack object: memory on these stacks, which is
+// scanned here like the rest of them.
 func markStack() {
 	// Scan the system stack.
 	var sysSP uintptr

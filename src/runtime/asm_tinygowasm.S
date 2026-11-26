@@ -24,6 +24,10 @@ tinygo_setCurrentStackPointer: // func setCurrentStackPointer(sp uintptr)
 // passes its stack object to this one, which LLVM cannot look into: for all
 // LLVM knows, it keeps the address for whatever is called next. It does
 // nothing, and wasm-opt removes the calls to it.
+//
+// The same goes for the other memory that LLVM must not rearrange behind the
+// back of the collector: stack variables that may hold a pointer, and new
+// allocations that have no slot in a stack object. See MakeGCStackSlots.
 .global  tinygo_exposeStackObject
 .hidden  tinygo_exposeStackObject
 .type    tinygo_exposeStackObject,@function

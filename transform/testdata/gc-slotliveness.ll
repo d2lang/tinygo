@@ -1,0 +1,845 @@
+target datalayout = "e-m:e-p:32:32-i64:64-n32:64-S128"
+target triple = "wasm32-unknown-unknown-wasm"
+
+@global = global ptr null
+@unwinding = global i32 0
+@table = constant [4 x i8] c"abcd"
+
+declare void @runtime.trackPointer(ptr nocapture readonly)
+
+declare noalias nonnull ptr @runtime.alloc(i32, ptr)
+
+; With these the pass makes the table of global roots, and only then does it
+; leave pointers without a slot.
+declare i32 @runtime.gcGlobalRootCount()
+
+declare ptr @runtime.gcGlobalRoot(i32)
+
+declare i32 @runtime.gcGlobalRootSize(i32)
+
+; Nothing is known about these, so they may collect.
+declare void @collect()
+
+declare void @collectWith(ptr)
+
+declare ptr @collectAndReturn(ptr)
+
+declare { ptr, i32 } @makeString()
+
+declare void @fill(ptr)
+
+declare void @llvm.memcpy.p0.p0.i32(ptr, ptr, i32, i1)
+
+declare i32 @setjmp(ptr) returns_twice
+
+; This one cannot collect.
+define i32 @leaf(ptr readonly captures(none) %p) {
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; A function that returns a new object, as LLVM has worked out.
+define noalias ptr @newObject() {
+  %p = call ptr @runtime.alloc(i32 8, ptr null)
+  call void @runtime.trackPointer(ptr %p)
+  ret ptr %p
+}
+
+; %kept is used after a call that may collect, %dropped only before it.
+; %dropped has no slot, so it is exposed: for LLVM it is no longer memory that
+; only this function knows.
+define i32 @liveAcrossCall() {
+  %kept = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %kept)
+  %dropped = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %dropped)
+  store i32 1, ptr %dropped
+  call void @collect()
+  %v = load i32, ptr %kept
+  ret i32 %v
+}
+
+; An argument of a call that may collect is in use during the call: the callee
+; does not root its parameters. An argument of a call that cannot collect is not.
+define i32 @liveAtCall() {
+  %kept = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %kept)
+  %dropped = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %dropped)
+  %v = call i32 @leaf(ptr %dropped)
+  call void @collectWith(ptr %kept)
+  ret i32 %v
+}
+
+; No slot, no stack object, nothing to clear. An allocation that is not used
+; at all is not exposed either, so that LLVM can remove it.
+define void @nothingLive() {
+  %unused = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %unused)
+  %dropped = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %dropped)
+  store i32 1, ptr %dropped
+  ret void
+}
+
+; A call to a function that cannot collect is not a reason for a slot.
+define i32 @acrossLeafCall() {
+  %dropped = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %dropped)
+  %a = call i32 @leaf(ptr %dropped)
+  %b = load i32, ptr %dropped
+  %c = add i32 %a, %b
+  ret i32 %c
+}
+
+; A call through a function pointer may collect.
+define i32 @acrossIndirectCall(ptr %fn) {
+  %kept = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %kept)
+  call void %fn()
+  %v = load i32, ptr %kept
+  ret i32 %v
+}
+
+; runtime.KeepAlive is inline assembly that takes the pointer. It is treated
+; like a call through a function pointer.
+define void @keepAlive() {
+  %kept = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %kept)
+  call void @collect()
+  call void asm sideeffect "", "r"(ptr %kept)
+  ret void
+}
+
+; H3. An interior pointer keeps the object in use.
+define i32 @interiorPointer() {
+  %kept = call ptr @runtime.alloc(i32 8, ptr null)
+  call void @runtime.trackPointer(ptr %kept)
+  %field = getelementptr i8, ptr %kept, i32 4
+  call void @collect()
+  %v = load i32, ptr %field
+  ret i32 %v
+}
+
+; H3. So does the pointer as an integer, and what is computed from it. The
+; pointer that is made from the integer is itself not in use at a call.
+define i32 @integerRoundTrip() {
+  %kept = call ptr @runtime.alloc(i32 8, ptr null)
+  call void @runtime.trackPointer(ptr %kept)
+  %int = ptrtoint ptr %kept to i32
+  call void @collect()
+  %next = add i32 %int, 4
+  %field = inttoptr i32 %next to ptr
+  call void @runtime.trackPointer(ptr %field)
+  %v = load i32, ptr %field
+  ret i32 %v
+}
+
+; H3. The pointer of a string that is only asked for its length afterwards is
+; not in use.
+define i32 @stringLength() {
+  %s = call { ptr, i32 } @makeString()
+  %s.data = extractvalue { ptr, i32 } %s, 0
+  call void @runtime.trackPointer(ptr %s.data)
+  call void @collect()
+  %s.len = extractvalue { ptr, i32 } %s, 1
+  ret i32 %s.len
+}
+
+; H3. Here the tracked value is not used again, but the same field is taken out
+; of the string a second time after the call.
+define i8 @stringData() {
+  %s = call { ptr, i32 } @makeString()
+  %s.data = extractvalue { ptr, i32 } %s, 0
+  call void @runtime.trackPointer(ptr %s.data)
+  call void @collect()
+  %again = extractvalue { ptr, i32 } %s, 0
+  %v = load i8, ptr %again
+  ret i8 %v
+}
+
+; H3. The compiler repacks the result of a call and tracks the pointer it takes
+; out of the copy, after the check for a panic. The slot is for the pointer as
+; the call returned it, and is filled right after the call.
+define i8 @repackedString() {
+entry:
+  %s = call { ptr, i32 } @makeString()
+  %s.data = extractvalue { ptr, i32 } %s, 0
+  %copy.0 = insertvalue { ptr, i32 } poison, ptr %s.data, 0
+  %s.len = extractvalue { ptr, i32 } %s, 1
+  %copy = insertvalue { ptr, i32 } %copy.0, i32 %s.len, 1
+  %unwinding = load i32, ptr @unwinding
+  %ok = icmp eq i32 %unwinding, 0
+  br i1 %ok, label %continue, label %unwind
+
+continue:
+  %data = extractvalue { ptr, i32 } %copy, 0
+  call void @runtime.trackPointer(ptr %data)
+  call void @collect()
+  %v = load i8, ptr %data
+  ret i8 %v
+
+unwind:
+  ret i8 undef
+}
+
+; H3. A pointer inside an aggregate that is passed to a call.
+define void @aggregateArgument(i32 %len) {
+  %kept = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %kept)
+  %s.0 = insertvalue { ptr, i32 } poison, ptr %kept, 0
+  %s = insertvalue { ptr, i32 } %s.0, i32 %len, 1
+  call void @collectWithString({ ptr, i32 } %s)
+  ret void
+}
+
+declare void @collectWithString({ ptr, i32 })
+
+; H3. A value merged from two pointers keeps both in use: each on its own path.
+define i32 @mergedPointers(i1 %condition) {
+entry:
+  br i1 %condition, label %left, label %right
+
+left:
+  %a = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %a)
+  br label %join
+
+right:
+  %b = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %b)
+  br label %join
+
+join:
+  %merged = phi ptr [ %a, %left ], [ %b, %right ]
+  call void @collect()
+  %v = load i32, ptr %merged
+  ret i32 %v
+}
+
+; H3. The same with a select. %c is not selected and not used later.
+define i32 @selectedPointers(i1 %condition) {
+  %a = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %a)
+  %b = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %b)
+  %c = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %c)
+  store i32 0, ptr %c
+  %selected = select i1 %condition, ptr %a, ptr %b
+  call void @collect()
+  %v = load i32, ptr %selected
+  ret i32 %v
+}
+
+; H3. The value of %previous is the object of the iteration before. Its slot
+; is its own: the slot of %current is overwritten before %previous is used.
+; %current is in use until the end of the block, where the phi takes it, and
+; a call comes before that.
+define void @loopCarried(i1 %repeat) {
+entry:
+  br label %loop
+
+loop:
+  %previous = phi ptr [ null, %entry ], [ %current, %loop ]
+  call void @runtime.trackPointer(ptr %previous)
+  %current = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %current)
+  call void @collectWith(ptr %previous)
+  br i1 %repeat, label %loop, label %end
+
+end:
+  ret void
+}
+
+; H3. Nothing is in use at a call here: %previous is read before the
+; allocation, and %current goes round the loop without passing one.
+define i32 @loopNotLive(i1 %repeat) {
+entry:
+  br label %loop
+
+loop:
+  %previous = phi ptr [ @global, %entry ], [ %current, %loop ]
+  call void @runtime.trackPointer(ptr %previous)
+  %v = load i32, ptr %previous
+  %current = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %current)
+  br i1 %repeat, label %loop, label %end
+
+end:
+  ret i32 %v
+}
+
+; H3. A phi in a loop that the compiler did not track gets a slot all the same.
+define i32 @loopUntrackedPhi(i1 %repeat) {
+entry:
+  %first = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %first)
+  br label %loop
+
+loop:
+  %previous = phi ptr [ %first, %entry ], [ %current, %loop ]
+  %current = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %current)
+  %v = load i32, ptr %previous
+  br i1 %repeat, label %loop, label %end
+
+end:
+  ret i32 %v
+}
+
+; H3. A pointer that was loaded and not tracked gets a slot if it is in use at
+; a call.
+define i32 @untrackedLoad() {
+  %kept = load ptr, ptr @global
+  %dropped = load ptr, ptr @global
+  %a = load i32, ptr %dropped
+  call void @collect()
+  %b = load i32, ptr %kept
+  %c = add i32 %a, %b
+  ret i32 %c
+}
+
+; H4. After a call, the code that the compiler emits tests whether a panic is
+; unwinding the stack and if so runs the deferred calls, which may collect and
+; which use %deferred. %result is only used where the function returns.
+define ptr @unwindCheck() {
+entry:
+  %deferred = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %deferred)
+  %result = call ptr @collectAndReturn(ptr null)
+  call void @runtime.trackPointer(ptr %result)
+  %unwinding = load i32, ptr @unwinding
+  %ok = icmp eq i32 %unwinding, 0
+  br i1 %ok, label %continue, label %unwind
+
+continue:
+  ret ptr %result
+
+unwind:
+  call void @collectWith(ptr %deferred)
+  ret ptr null
+}
+
+; H4. The stack object has to be there during the call, so the call is no
+; longer marked as a tail call.
+define ptr @tailCall() {
+  %kept = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %kept)
+  %result = tail call ptr @collectAndReturn(ptr %kept)
+  ret ptr %result
+}
+
+; H4. Without anything exposed the mark can stay.
+define void @tailCallWithoutSlots() {
+  tail call void @collect()
+  ret void
+}
+
+; H4. A function that can be returned into twice keeps all its slots: this
+; analysis does not know where control comes back.
+define i32 @returnsTwice(ptr %buf) {
+  %a = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %a)
+  %b = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %b)
+  %again = call i32 @setjmp(ptr %buf)
+  %v = load i32, ptr %b
+  ret i32 %v
+}
+
+; H1. The result of a function that returns a new object is exposed like an
+; allocation.
+define i32 @newObjectWithoutSlot() {
+  %dropped = call ptr @newObject()
+  call void @runtime.trackPointer(ptr %dropped)
+  %v = load i32, ptr %dropped
+  call void @collect()
+  ret i32 %v
+}
+
+; H2. A pointer that is kept in a stack variable across a call. The variable
+; is exposed, so LLVM cannot turn it into a value later. The stack is scanned.
+define i32 @storedOnStack() {
+  %variable = alloca ptr
+  %dropped = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %dropped)
+  store ptr %dropped, ptr %variable
+  call void @collect()
+  %reloaded = load ptr, ptr %variable
+  call void @runtime.trackPointer(ptr %reloaded)
+  %v = load i32, ptr %reloaded
+  ret i32 %v
+}
+
+; H2. A function that is given the address of a stack variable may store a
+; pointer there, and may be inlined later.
+define i32 @filledByCallee() {
+  %variable = alloca ptr
+  call void @fill(ptr %variable)
+  call void @collect()
+  %reloaded = load ptr, ptr %variable
+  call void @runtime.trackPointer(ptr %reloaded)
+  %v = load i32, ptr %reloaded
+  ret i32 %v
+}
+
+; H2. A copy from somewhere on the heap may bring pointers.
+define i32 @copiedToStack(ptr %from) {
+  %variable = alloca { ptr, i32 }
+  call void @llvm.memcpy.p0.p0.i32(ptr %variable, ptr %from, i32 8, i1 false)
+  call void @collect()
+  %reloaded = load ptr, ptr %variable
+  call void @runtime.trackPointer(ptr %reloaded)
+  %v = load i32, ptr %reloaded
+  ret i32 %v
+}
+
+; H2. What a parameter points to is rooted by the caller. A stack variable
+; that holds nothing else is left alone.
+define i32 @parameterOnStack(ptr %p) {
+  %variable = alloca ptr
+  store ptr %p, ptr %variable
+  call void @collect()
+  %reloaded = load ptr, ptr %variable
+  call void @runtime.trackPointer(ptr %reloaded)
+  %v = load i32, ptr %reloaded
+  ret i32 %v
+}
+
+; H2. This variable holds a pointer, but nothing can collect between the
+; store and the last use of the variable.
+define i32 @stackNotAtCollection() {
+  %variable = alloca ptr
+  call void @collect()
+  %dropped = call ptr @runtime.alloc(i32 4, ptr null)
+  call void @runtime.trackPointer(ptr %dropped)
+  store ptr %dropped, ptr %variable
+  %v = call i32 @leaf(ptr %variable)
+  ret i32 %v
+}
+
+; H2. These stack variables cannot hold a pointer into the heap: one only has
+; integers and the address of a global stored in it and is read by a function
+; that does not keep its address, the other is a copy of constant data.
+define i32 @stackWithoutPointers(i32 %x) {
+  %numbers = alloca { i32, ptr }
+  %text = alloca [4 x i8]
+  store i32 %x, ptr %numbers
+  %second = getelementptr { i32, ptr }, ptr %numbers, i32 0, i32 1
+  store ptr @global, ptr %second
+  call void @llvm.memcpy.p0.p0.i32(ptr %text, ptr @table, i32 4, i1 false)
+  call void @collect()
+  %a = call i32 @leaf(ptr %numbers)
+  %b = call i32 @leaf(ptr %text)
+  %c = add i32 %a, %b
+  ret i32 %c
+}
+
+declare void @takesInteger(i32)
+
+; LLVM copies two pointers as one i64. With the variable they were copied to
+; gone, that integer is all that has them during the call.
+define i32 @integerCopy(ptr %from) {
+  %both = load i64, ptr %from
+  call void @collect()
+  %low = trunc i64 %both to i32
+  %p = inttoptr i32 %low to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; The integer goes back to memory as it is, where it is a pointer again for
+; whoever loads it.
+define void @integerCopyStored(ptr %from, ptr %to) {
+  %both = load i64, ptr %from
+  call void @collect()
+  store i64 %both, ptr %to
+  ret void
+}
+
+; The half that is used is taken before the call. The slot is that of the
+; load: it is rooted where it is made.
+define i32 @integerCopyHalf(ptr %from) {
+  %both = load i64, ptr %from
+  %shifted = lshr i64 %both, 32
+  %high = trunc i64 %shifted to i32
+  call void @collect()
+  %p = inttoptr i32 %high to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; An address can be computed from the integer without an inttoptr.
+define i32 @integerAddress(ptr %from) {
+  %n = load i32, ptr %from
+  call void @collect()
+  %p = getelementptr i8, ptr null, i32 %n
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; What an address is computed from is a pointer, however it is computed.
+define i32 @integerSum(ptr %from) {
+  %n = load i32, ptr %from
+  %next = add i32 %n, 4
+  call void @collect()
+  %p = inttoptr i32 %next to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; An integer that is passed on after the call may be a pointer to whoever gets
+; it. What a call returns is an integer in Go as well.
+define i32 @integerPassedOn(ptr %from) {
+  %n = load i32, ptr %from
+  %m = call i32 @leaf(ptr %from)
+  call void @collect()
+  call void @takesInteger(i32 %n)
+  ret i32 %m
+}
+
+; An integer that is only calculated with or compared after the call is in
+; use as well. One that is passed on before anything collects is not.
+define i32 @integerCalculated(ptr %from) {
+  %n = load i32, ptr %from
+  %m = load i32, ptr %from
+  call void @takesInteger(i32 %m)
+  call void @collect()
+  %sum = add i32 %n, 1
+  %big = icmp ugt i32 %n, 10
+  %r = select i1 %big, i32 %sum, i32 0
+  ret i32 %r
+}
+
+; Two pointers copied as integers and compared after a collection: if the
+; first object was freed, a new one at its address would compare equal.
+define i1 @integerIdentity(ptr %a, ptr %b) {
+  %old = load i32, ptr %a
+  store ptr null, ptr %a
+  call void @collect()
+  %new = load i32, ptr %b
+  %same = icmp eq i32 %old, %new
+  ret i1 %same
+}
+
+; Arithmetic on the integer after the call does not make it any less
+; a pointer: here it becomes an interior address that is stored for later.
+define void @integerOffsetStored(ptr %from, ptr %to) {
+  %n = load i32, ptr %from
+  call void @collect()
+  %m = add i32 %n, 4
+  store i32 %m, ptr %to
+  ret void
+}
+
+; A load that the front end marked as one of a value of a Go type without
+; pointers reads no pointer.
+define i32 @integerNoPointers(ptr %from) {
+  %n = load i32, ptr %from, !tinygo.noptr !0
+  call void @collect()
+  %sum = add i32 %n, 1
+  ret i32 %sum
+}
+
+; Unless an address is computed from it.
+define i32 @integerNoPointersAddress(ptr %from) {
+  %n = load i32, ptr %from, !tinygo.noptr !0
+  call void @collect()
+  %p = inttoptr i32 %n to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+declare void @collectWithInteger(i32)
+
+; An integer given to the collecting call itself is an integer to the callee.
+define void @integerArgument(ptr %from) {
+  %n = load i32, ptr %from
+  call void @collectWithInteger(i32 %n)
+  ret void
+}
+
+; Whatever an address is computed from is kept as it is, a double included.
+define i32 @doubleAddress(ptr %from) {
+  %d = load double, ptr %from
+  call void @collect()
+  %bits = bitcast double %d to i64
+  %low = trunc i64 %bits to i32
+  %p = inttoptr i32 %low to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; A pointer that runs one element ahead points past the end of the object in
+; the last round, so the slot of the phi does not keep the object then. The
+; pointer it was computed from needs a slot as well.
+define i32 @pointerAhead(ptr %from, i32 %n) {
+entry:
+  %base = load ptr, ptr %from
+  %first = getelementptr i8, ptr %base, i32 4
+  br label %loop
+
+loop:
+  %ahead = phi ptr [ %first, %entry ], [ %next, %loop ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop ]
+  call void @collect()
+  %elem = getelementptr i8, ptr %ahead, i32 -4
+  %v = load i32, ptr %elem
+  %next = getelementptr i8, ptr %ahead, i32 4
+  %i.next = add i32 %i, 1
+  %done = icmp eq i32 %i.next, %n
+  br i1 %done, label %end, label %loop
+
+end:
+  ret i32 %v
+}
+
+; A pointer that steps through an object from its start can point past its
+; end at a collection, where the slot of the phi no longer keeps the object:
+; the allocation it starts from needs a slot of its own.
+define i32 @pointerStepsFromStart() {
+entry:
+  %base = call ptr @runtime.alloc(i32 16, ptr null)
+  br label %loop
+
+loop:
+  %q = phi ptr [ %base, %entry ], [ %next, %loop ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop ]
+  call void @collect()
+  %behind = getelementptr i8, ptr %q, i32 -12
+  %v = load i32, ptr %behind
+  %next = getelementptr i8, ptr %q, i32 4
+  %i.next = add i32 %i, 1
+  %done = icmp eq i32 %i.next, 8
+  br i1 %done, label %end, label %loop
+
+end:
+  ret i32 %v
+}
+
+; A string that is sliced in a loop steps its data pointer: the string it
+; starts from, which a call returned, needs its pointer in a slot too.
+define i8 @stringSliced() {
+entry:
+  %s = call { ptr, i32 } @makeString()
+  br label %loop
+
+loop:
+  %cur = phi { ptr, i32 } [ %s, %entry ], [ %rest, %loop ]
+  call void @collect()
+  %data = extractvalue { ptr, i32 } %cur, 0
+  %behind = getelementptr i8, ptr %data, i32 -1
+  %c = load i8, ptr %behind
+  %next = getelementptr i8, ptr %data, i32 1
+  %len = extractvalue { ptr, i32 } %cur, 1
+  %len.next = sub i32 %len, 1
+  %r0 = insertvalue { ptr, i32 } undef, ptr %next, 0
+  %rest = insertvalue { ptr, i32 } %r0, i32 %len.next, 1
+  %done = icmp eq i32 %len.next, 0
+  br i1 %done, label %end, label %loop
+
+end:
+  ret i8 %c
+}
+
+; The same with the address stepped as an integer that a load made.
+define i32 @integerStepsFromLoad(ptr %from) {
+entry:
+  %x = load i32, ptr %from
+  br label %loop
+
+loop:
+  %ip = phi i32 [ %x, %entry ], [ %ip.next, %loop ]
+  call void @collect()
+  %addr = add i32 %ip, -4
+  %p = inttoptr i32 %addr to ptr
+  %v = load i32, ptr %p
+  %ip.next = add i32 %ip, 4
+  %done = icmp eq i32 %v, 0
+  br i1 %done, label %end, label %loop
+
+end:
+  ret i32 %v
+}
+
+; A tracked value outside a loop can hold the address just past the end of
+; an object, too: what it is computed from needs a slot.
+define i32 @trackedEnd(i1 %c, ptr %other) {
+  %base = call ptr @runtime.alloc(i32 16, ptr null)
+  %end = getelementptr i8, ptr %base, i32 16
+  %p = select i1 %c, ptr %end, ptr %other
+  call void @runtime.trackPointer(ptr %p)
+  call void @collect()
+  %last = getelementptr i8, ptr %p, i32 -4
+  %v = load i32, ptr %last
+  ret i32 %v
+}
+
+declare { i32, double } @makePair()
+
+; An address computed from a field that is not an integer: the field is kept
+; as it is.
+define i32 @doubleFieldAddress(ptr %from) {
+  %pair = load { i32, double }, ptr %from
+  call void @collect()
+  %d = extractvalue { i32, double } %pair, 1
+  %bits = bitcast double %d to i64
+  %low = trunc i64 %bits to i32
+  %p = inttoptr i32 %low to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; The bits of a pointer of 32 bits survive a double: an address computed after
+; such a round trip comes from the load before it.
+define i32 @floatRoundTrip(ptr %from) {
+  %n = load i32, ptr %from
+  %d = uitofp i32 %n to double
+  call void @collect()
+  %m = fptoui double %d to i32
+  %p = inttoptr i32 %m to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+declare <2 x ptr> @twoPointers()
+
+; Where the pass cannot follow what happens (a vector here) it keeps what
+; a call returns as well, a vector of pointers included.
+define i32 @vectorResult() {
+  %pair = call <2 x ptr> @twoPointers()
+  call void @collect()
+  %p = extractelement <2 x ptr> %pair, i32 0
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+declare ptr @llvm.ptrmask.p0.i32(ptr, i32)
+
+; A tracked value that changes the pointer it is made of does not hold that
+; pointer: the allocation needs a slot of its own.
+define i32 @trackedMask() {
+  %base = call ptr @runtime.alloc(i32 16, ptr null)
+  %end = getelementptr i8, ptr %base, i32 16
+  %masked = call ptr @llvm.ptrmask.p0.i32(ptr %end, i32 -8)
+  call void @runtime.trackPointer(ptr %masked)
+  call void @collect()
+  %last = getelementptr i8, ptr %masked, i32 -4
+  %v = load i32, ptr %last
+  ret i32 %v
+}
+
+declare <2 x ptr> @llvm.masked.load.v2p0.p0(ptr, i32 immarg, <2 x i1>, <2 x ptr>)
+
+; An intrinsic that reads memory brings in what it read, like a load.
+define i32 @maskedLoad(ptr %from) {
+  %pair = call <2 x ptr> @llvm.masked.load.v2p0.p0(ptr %from, i32 4, <2 x i1> <i1 true, i1 true>, <2 x ptr> poison)
+  call void @collect()
+  %p = extractelement <2 x ptr> %pair, i32 0
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+declare { <2 x ptr> } @vectorInStruct()
+
+; A vector of pointers inside an aggregate is a pointer field.
+define i32 @vectorField() {
+  %s = call { <2 x ptr> } @vectorInStruct()
+  call void @collect()
+  %pair = extractvalue { <2 x ptr> } %s, 0
+  %p = extractelement <2 x ptr> %pair, i32 0
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; A double field holds no pointer unless an address is computed from it.
+define double @doubleField(ptr %from) {
+  %s = load { ptr, i32, double }, ptr %from
+  call void @collect()
+  %d = extractvalue { ptr, i32, double } %s, 2
+  %sum = fadd double %d, 1.0
+  ret double %sum
+}
+
+; A loop that only shortens a string does not step its pointer: the slot of
+; the phi holds what it starts from.
+define i32 @stringShortened() {
+entry:
+  %s = call { ptr, i32 } @makeString()
+  br label %loop
+
+loop:
+  %cur = phi { ptr, i32 } [ %s, %entry ], [ %rest, %loop ]
+  call void @collect()
+  %data = extractvalue { ptr, i32 } %cur, 0
+  %c = load i8, ptr %data
+  %len = extractvalue { ptr, i32 } %cur, 1
+  %len.next = sub i32 %len, 1
+  %rest = insertvalue { ptr, i32 } %cur, i32 %len.next, 1
+  %done = icmp eq i32 %len.next, 0
+  br i1 %done, label %end, label %loop
+
+end:
+  ret i32 %len
+}
+
+; A phi that only chooses among the pointers that loads made holds the one
+; in use: the loads need no slots of their own.
+define void @listWalk(ptr %head) {
+entry:
+  %first = load ptr, ptr %head
+  br label %loop
+
+loop:
+  %node = phi ptr [ %first, %entry ], [ %next, %loop ]
+  call void @collectWith(ptr %node)
+  %next = load ptr, ptr %node
+  %end = icmp eq ptr %next, null
+  br i1 %end, label %done, label %loop
+
+done:
+  ret void
+}
+
+; An integer that is carried round a loop outlives the slot of the load.
+define void @integerLoop(ptr %from, ptr %to, i1 %repeat) {
+entry:
+  br label %loop
+
+loop:
+  %previous = phi i32 [ 0, %entry ], [ %current, %loop ]
+  %current = load i32, ptr %from
+  call void @collect()
+  store i32 %previous, ptr %to
+  br i1 %repeat, label %loop, label %end
+
+end:
+  ret void
+}
+
+; A stack variable that gets half of such an integer has to stay in memory.
+define i32 @integerOnStack(ptr %from) {
+  %variable = alloca i32
+  %both = load i64, ptr %from
+  %low = trunc i64 %both to i32
+  store i32 %low, ptr %variable
+  call void @collect()
+  %v = call i32 @leaf(ptr %variable)
+  ret i32 %v
+}
+
+; Where the pass cannot follow what happens it keeps every value that may
+; bring a pointer into the function, in use or not, as it keeps every tracked
+; pointer.
+define i32 @integerCopyReturnsTwice(ptr %from, ptr %buf) {
+  %both = load i64, ptr %from
+  %again = call i32 @setjmp(ptr %buf)
+  call void @collect()
+  %low = trunc i64 %both to i32
+  %p = inttoptr i32 %low to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+!0 = !{}

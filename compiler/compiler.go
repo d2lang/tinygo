@@ -1864,7 +1864,31 @@ func (b *builder) loadFromStorage(ptr llvm.Value, typ types.Type, name string) l
 	if b.isIndirectAggregate(llvmType) {
 		return b.copyToIndirectStorage(ptr, llvmType, name)
 	}
-	return b.CreateLoad(llvmType, ptr, name)
+	value := b.CreateLoad(llvmType, ptr, name)
+	if hasNoPointerWords(typ) {
+		value.SetMetadata(b.ctx.MDKindID(llvmutil.NoPointerMDName), b.ctx.MDNode(nil))
+	}
+	return value
+}
+
+// hasNoPointerWords returns whether a value of Go type t is made of integers,
+// floats and booleans only. A uintptr and an unsafe.Pointer are not: they can
+// hold an address.
+func hasNoPointerWords(t types.Type) bool {
+	switch t := t.Underlying().(type) {
+	case *types.Basic:
+		return t.Info()&(types.IsBoolean|types.IsInteger|types.IsFloat|types.IsComplex) != 0 && t.Kind() != types.Uintptr
+	case *types.Struct:
+		for i := 0; i < t.NumFields(); i++ {
+			if !hasNoPointerWords(t.Field(i).Type()) {
+				return false
+			}
+		}
+		return true
+	case *types.Array:
+		return t.Len() == 0 || hasNoPointerWords(t.Elem())
+	}
+	return false
 }
 
 func (b *builder) getValueField(value ssa.Value, index int, resultType types.Type, name string) (llvm.Value, bool) {

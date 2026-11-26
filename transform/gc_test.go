@@ -2,17 +2,53 @@ package transform_test
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/tinygo-org/tinygo/transform"
 	"tinygo.org/x/go-llvm"
 )
 
+// The pass checks itself in these tests: no integer that may be a pointer is
+// left without a slot across a collection (see transform.GCSlotCheck).
+var gcSlotCheck struct {
+	sync.Mutex
+	failures []string
+}
+
+func init() {
+	transform.GCSlotCheck = func(function, value, deliveredTo string) {
+		gcSlotCheck.Lock()
+		defer gcSlotCheck.Unlock()
+		gcSlotCheck.failures = append(gcSlotCheck.failures, function+": "+value+" has no slot, delivered to "+deliveredTo)
+	}
+}
+
+func checkGCSlots(t *testing.T) {
+	gcSlotCheck.Lock()
+	defer gcSlotCheck.Unlock()
+	for _, failure := range gcSlotCheck.failures {
+		t.Error(failure)
+	}
+	gcSlotCheck.failures = nil
+}
+
 func TestMakeGCStackSlots(t *testing.T) {
 	t.Parallel()
 	testTransform(t, "testdata/gc-stackslots", func(mod llvm.Module) {
 		transform.MakeGCStackSlots(mod)
 	})
+	checkGCSlots(t)
+}
+
+// TestGCSlotLiveness checks which pointers get a stack slot, which do not, and
+// what is exposed instead.
+func TestGCSlotLiveness(t *testing.T) {
+	t.Parallel()
+	testTransform(t, "testdata/gc-slotliveness", func(mod llvm.Module) {
+		transform.MakeGCStackSlots(mod)
+	})
+	checkGCSlots(t)
 }
 
 func TestMakeGCGlobalRootsAVR(t *testing.T) {
