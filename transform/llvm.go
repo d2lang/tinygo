@@ -49,6 +49,8 @@ func typeHasPointers(typ llvm.Type) bool {
 		}
 	case llvm.ArrayTypeKind:
 		return typ.ArrayLength() != 0 && typeHasPointers(typ.ElementType())
+	case llvm.VectorTypeKind:
+		return typeHasPointers(typ.ElementType())
 	}
 	return false
 }

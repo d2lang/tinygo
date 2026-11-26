@@ -715,6 +715,75 @@ define i32 @vectorResult() {
   ret i32 %v
 }
 
+declare ptr @llvm.ptrmask.p0.i32(ptr, i32)
+
+; A tracked value that changes the pointer it is made of does not hold that
+; pointer: the allocation needs a slot of its own.
+define i32 @trackedMask() {
+  %base = call ptr @runtime.alloc(i32 16, ptr null)
+  %end = getelementptr i8, ptr %base, i32 16
+  %masked = call ptr @llvm.ptrmask.p0.i32(ptr %end, i32 -8)
+  call void @runtime.trackPointer(ptr %masked)
+  call void @collect()
+  %last = getelementptr i8, ptr %masked, i32 -4
+  %v = load i32, ptr %last
+  ret i32 %v
+}
+
+declare <2 x ptr> @llvm.masked.load.v2p0.p0(ptr, i32 immarg, <2 x i1>, <2 x ptr>)
+
+; An intrinsic that reads memory brings in what it read, like a load.
+define i32 @maskedLoad(ptr %from) {
+  %pair = call <2 x ptr> @llvm.masked.load.v2p0.p0(ptr %from, i32 4, <2 x i1> <i1 true, i1 true>, <2 x ptr> poison)
+  call void @collect()
+  %p = extractelement <2 x ptr> %pair, i32 0
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+declare { <2 x ptr> } @vectorInStruct()
+
+; A vector of pointers inside an aggregate is a pointer field.
+define i32 @vectorField() {
+  %s = call { <2 x ptr> } @vectorInStruct()
+  call void @collect()
+  %pair = extractvalue { <2 x ptr> } %s, 0
+  %p = extractelement <2 x ptr> %pair, i32 0
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; A double field holds no pointer unless an address is computed from it.
+define double @doubleField(ptr %from) {
+  %s = load { ptr, i32, double }, ptr %from
+  call void @collect()
+  %d = extractvalue { ptr, i32, double } %s, 2
+  %sum = fadd double %d, 1.0
+  ret double %sum
+}
+
+; A loop that only shortens a string does not step its pointer: the slot of
+; the phi holds what it starts from.
+define i32 @stringShortened() {
+entry:
+  %s = call { ptr, i32 } @makeString()
+  br label %loop
+
+loop:
+  %cur = phi { ptr, i32 } [ %s, %entry ], [ %rest, %loop ]
+  call void @collect()
+  %data = extractvalue { ptr, i32 } %cur, 0
+  %c = load i8, ptr %data
+  %len = extractvalue { ptr, i32 } %cur, 1
+  %len.next = sub i32 %len, 1
+  %rest = insertvalue { ptr, i32 } %cur, i32 %len.next, 1
+  %done = icmp eq i32 %len.next, 0
+  br i1 %done, label %end, label %loop
+
+end:
+  ret i32 %len
+}
+
 ; A phi that only chooses among the pointers that loads made holds the one
 ; in use: the loads need no slots of their own.
 define void @listWalk(ptr %head) {

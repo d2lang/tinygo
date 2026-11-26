@@ -144,6 +144,7 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 		readNoneKind:  llvm.AttributeKindID("readnone"),
 		noCaptureKind: llvm.AttributeKindID(llvmutil.NoCaptureAttrName()),
 		twiceKind:     llvm.AttributeKindID("returns_twice"),
+		memoryKind:    memAttr,
 		noPointerKind: ctx.MDKindID(llvmutil.NoPointerMDName),
 	}
 	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
@@ -180,7 +181,7 @@ type gcSlotPass struct {
 	collectors   map[llvm.Value]struct{}
 	prune        bool
 
-	noAliasKind, readOnlyKind, readNoneKind, noCaptureKind, twiceKind uint
+	noAliasKind, readOnlyKind, readNoneKind, noCaptureKind, twiceKind, memoryKind uint
 
 	// noPointerKind is the metadata kind of llvmutil.NoPointerMDName.
 	noPointerKind int
@@ -487,6 +488,10 @@ type gcSlotFunc struct {
 	intBits    []bool
 	fromHere   []bool
 
+	// sure says that an address is computed from the value: it holds
+	// a pointer whatever its type.
+	sure []bool
+
 	// boundary marks the values that may get a slot of their own. The search
 	// for what a pointer in use is made of stops at them, except where
 	// passesThrough says otherwise.
@@ -609,8 +614,15 @@ func (p *gcSlotPass) newSlotFunc(fn llvm.Value) *gcSlotFunc {
 				// A function pointer or inline assembly.
 				f.collecting[i] = true
 			case callee.IntrinsicID() != 0:
-				// Intrinsics do not call back into the program.
+				// Intrinsics do not call back into the program. One that
+				// may read memory and returns a value (a masked load or
+				// gather) brings that value in like a load.
 				f.kind[i] = slotFlow
+				if inst.Type().TypeKind() != llvm.VoidTypeKind {
+					if mem := callee.GetEnumFunctionAttribute(p.memoryKind); mem.IsNil() || mem.GetEnumValue() != 0 {
+						f.kind[i] = slotOrigin
+					}
+				}
 			default:
 				_, external := p.collectors[callee]
 				_, internal := p.trackFuncs[callee]
@@ -716,13 +728,23 @@ func (f *gcSlotFunc) wholeSlot(typ llvm.Type) bool {
 // wherever it comes from. And whatever is computed from a value that may have
 // a pointer in it, through any calculation, may have its bits too.
 //
-// A piece of a pointer narrower than a pointer cannot be held in a slot: the
-// collector reads whole words. Go takes the bits of a pointer apart only as
-// a uintptr, which keeps nothing alive, so LLVM has no reason to make such
-// pieces of a pointer that is still in use.
+// What a slot cannot hold, and what Go code does not make:
+//   - A piece of a pointer narrower than a pointer: the collector reads whole
+//     words. Go takes the bits of a pointer apart only as a uintptr, which
+//     keeps nothing alive, so LLVM has no reason to make such pieces of
+//     a pointer that is still in use.
+//   - A float made from a pointer by a conversion rather than a bitcast: its
+//     bits are not those of the pointer. The search goes back through the
+//     conversion to the integer, but a phi in a loop that carries such
+//     a float into the next round holds only the float.
+//   - A mark on a load whose bits LLVM also uses as a pointer: its GVN can
+//     forward a marked integer load to a load of a pointer from the same
+//     address, keeping the mark. That needs memory that the program reads
+//     both as a Go integer and as a pointer, which only unsafe code does.
 func (f *gcSlotFunc) findCarriers() {
 	n := int32(len(f.insts))
-	sure := make([]bool, n)
+	f.sure = make([]bool, n)
+	sure := f.sure
 	f.stack = f.stack[:0]
 	mark := func(value int32) {
 		if value >= 0 && !sure[value] && f.insts[value].Type().TypeKind() != llvm.PointerTypeKind {
@@ -754,7 +776,7 @@ func (f *gcSlotFunc) findCarriers() {
 		switch {
 		case sure[i], f.opcode[i] == llvm.PtrToInt, f.opcode[i] == opPtrToAddr:
 			f.intBits[i] = true
-		case f.kind[i] == slotOrigin && f.opcode[i] != llvm.Call:
+		case f.kind[i] == slotOrigin && (f.opcode[i] != llvm.Call || f.isMemoryIntrinsic(i)):
 			f.intBits[i] = f.canCarry(f.insts[i].Type()) && !f.noPointers(i)
 		}
 	}
@@ -845,11 +867,29 @@ func (f *gcSlotFunc) passesThrough(user int32) bool {
 	return f.kind[user] == slotFlow
 }
 
+// operandsNeeded returns whether what a value with a slot that the search
+// passes through is made of is needed itself, rather than held by that slot:
+// when the value changes what goes into it (see keepsValue: a tracked
+// intrinsic, say), or is a phi in a loop that steps through an object.
+func (f *gcSlotFunc) operandsNeeded(user int32) bool {
+	return !f.keepsValue(user) || f.isCyclicPhi(user) && f.selfDerived(user)
+}
+
 // selfDerived returns whether a phi in a loop is computed from its own value
 // with an address computed on the way: a pointer that steps through an
 // object. Its value can then point past the end of the object it started in,
 // where its slot no longer keeps that object, so the values it starts from
 // need slots of their own, even those that a load or a call made.
+//
+// Only steps that the function computes itself are seen. A pointer that
+// a callee computes from the loop pointer (p = step(p)), or that comes back
+// from memory (a variable a closure captured, for one), is taken to point
+// into its object or just past its data, as the rules of package unsafe
+// require of every pointer; the object's header, which follows its data,
+// still lies there. The same goes for a pointer that a loop phi carries from
+// one round into the next. TinyGo's original pass kept every allocation in
+// a slot for the whole function, so code that breaks those rules could get
+// away with it there and not here.
 func (f *gcSlotFunc) selfDerived(phi int32) bool {
 	if result, ok := f.derivedPhis[phi]; ok {
 		return result
@@ -862,7 +902,7 @@ func (f *gcSlotFunc) selfDerived(phi int32) bool {
 	var stack []item
 	push := func(user int32, derived bool) {
 		for slot := f.opStart[user]; slot < f.opStart[user+1]; slot++ {
-			if operand := f.ops[slot]; operand >= 0 && f.bitsFlow(slot) {
+			if operand := f.ops[slot]; operand >= 0 && f.bitsFlow(slot) && (f.hasPointer[operand] || f.intBits[operand]) {
 				it := item{operand, derived}
 				if _, ok := seen[it]; !ok {
 					seen[it] = struct{}{}
@@ -1137,26 +1177,43 @@ func (f *gcSlotFunc) source(ptr llvm.Value) (def, agg int32, path []uint32) {
 }
 
 // carrierPaths appends the index path of every field in a value of type typ
-// that is not a pointer but has room for one: an integer, or a float or
-// a vector whose bits an address may be computed from.
-func (f *gcSlotFunc) carrierPaths(typ llvm.Type, prefix []uint32, paths [][]uint32) [][]uint32 {
+// that is not a pointer but may hold one: an integer or a vector with room
+// for a pointer, and with floats set (the value is one an address is computed
+// from, see sure) a float or a double as well. LLVM never makes a float of
+// a pointer that Go code copies, so only an address computed from one makes
+// it hold a pointer.
+func (f *gcSlotFunc) carrierPaths(typ llvm.Type, prefix []uint32, paths [][]uint32, floats bool) [][]uint32 {
 	switch typ.TypeKind() {
-	case llvm.IntegerTypeKind, llvm.FloatTypeKind, llvm.DoubleTypeKind, llvm.VectorTypeKind:
-		if f.wholeSlot(typ) {
+	case llvm.IntegerTypeKind, llvm.VectorTypeKind, llvm.FloatTypeKind, llvm.DoubleTypeKind:
+		if f.fieldCarries(typ, floats) {
 			paths = append(paths, append([]uint32(nil), prefix...))
 		}
 	case llvm.StructTypeKind:
 		for i, field := range typ.StructElementTypes() {
-			paths = f.carrierPaths(field, append(prefix, uint32(i)), paths)
+			paths = f.carrierPaths(field, append(prefix, uint32(i)), paths, floats)
 		}
 	case llvm.ArrayTypeKind:
-		if elem := typ.ElementType(); f.canCarry(elem) || f.wholeSlot(elem) {
+		if elem := typ.ElementType(); f.canCarry(elem) || f.fieldCarries(elem, floats) {
 			for i := 0; i < typ.ArrayLength(); i++ {
-				paths = f.carrierPaths(typ.ElementType(), append(prefix, uint32(i)), paths)
+				paths = f.carrierPaths(elem, append(prefix, uint32(i)), paths, floats)
 			}
 		}
 	}
 	return paths
+}
+
+// fieldCarries returns whether a field of this scalar or vector type may hold
+// a pointer, see carrierPaths.
+func (f *gcSlotFunc) fieldCarries(typ llvm.Type, floats bool) bool {
+	switch typ.TypeKind() {
+	case llvm.IntegerTypeKind:
+		return f.canCarry(typ)
+	case llvm.VectorTypeKind:
+		return f.canCarry(typ) || floats && f.wholeSlot(typ)
+	case llvm.FloatTypeKind, llvm.DoubleTypeKind:
+		return floats && f.wholeSlot(typ)
+	}
+	return false
 }
 
 // pathsOverlap returns whether one field contains the other.
@@ -1184,8 +1241,23 @@ func pointerPaths(typ llvm.Type, prefix []uint32, paths [][]uint32) [][]uint32 {
 				paths = pointerPaths(typ.ElementType(), append(prefix, uint32(i)), paths)
 			}
 		}
+	case llvm.VectorTypeKind:
+		// A vector of pointers is kept whole.
+		if typeHasPointers(typ) {
+			paths = append(paths, append([]uint32(nil), prefix...))
+		}
 	}
 	return paths
+}
+
+// isMemoryIntrinsic returns whether the instruction is a call of an intrinsic
+// that reads memory and returns what it read, such as a masked load.
+func (f *gcSlotFunc) isMemoryIntrinsic(i int32) bool {
+	if f.opcode[i] != llvm.Call || f.kind[i] != slotOrigin {
+		return false
+	}
+	callee := f.insts[i].CalledValue().IsAFunction()
+	return !callee.IsNil() && callee.IntrinsicID() != 0
 }
 
 // liveSlots returns the pointers that need a slot. It looks at the tracked
@@ -1220,7 +1292,7 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 					add(f.extractField(int32(i), path))
 				}
 				if f.intBits[i] {
-					for _, path := range f.carrierPaths(typ, nil, nil) {
+					for _, path := range f.carrierPaths(typ, nil, nil, f.sure[i]) {
 						add(f.extractField(int32(i), path))
 					}
 				}
@@ -1288,7 +1360,7 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 			addSlot(-1, int32(i), path, false)
 		}
 		if ints {
-			for _, path := range f.carrierPaths(typ, nil, nil) {
+			for _, path := range f.carrierPaths(typ, nil, nil, f.sure[i]) {
 				addSlot(-1, int32(i), path, true)
 			}
 		}
@@ -1345,9 +1417,9 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 				// The slot of user roots what is used through it.
 				continue
 			}
-			// The slot of user holds what goes into it unchanged, unless it
-			// steps through an object.
-			asChosen = !(f.isCyclicPhi(user) && f.selfDerived(user))
+			// The slot of user holds what goes into it unchanged, unless
+			// user changes it or steps through an object.
+			asChosen = !f.operandsNeeded(user)
 		}
 		for slot := f.opStart[user]; slot < f.opStart[user+1]; slot++ {
 			operand := f.ops[slot]
@@ -1389,7 +1461,7 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 			if skip(user) {
 				continue
 			}
-			if f.boundary[user] && !(needed[user] && f.isCyclicPhi(user) && f.selfDerived(user)) {
+			if f.boundary[user] && !(needed[user] && f.passesThrough(user) && f.operandsNeeded(user)) {
 				// Its slot roots the field. A value with a slot that the
 				// search passes through holds it as well, see chosen; but
 				// a phi in a loop that steps through an object needs what it

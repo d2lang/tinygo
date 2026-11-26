@@ -826,6 +826,94 @@ define i32 @vectorResult() {
   ret i32 %v
 }
 
+; Function Attrs: nocallback nofree nounwind speculatable willreturn memory(none)
+declare ptr @llvm.ptrmask.p0.i32(ptr, i32) #2
+
+define i32 @trackedMask() {
+  %gc.stackobject = alloca { ptr, ptr }, align 8
+  store { ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %base = call ptr @runtime.alloc(i32 16, ptr null)
+  %1 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
+  store ptr %base, ptr %1, align 4
+  %end = getelementptr i8, ptr %base, i32 16
+  %masked = call ptr @llvm.ptrmask.p0.i32(ptr %end, i32 -8)
+  %2 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
+  store ptr %masked, ptr %2, align 4
+  call void @collect()
+  %last = getelementptr i8, ptr %masked, i32 -4
+  %v = load i32, ptr %last, align 4
+  ret i32 %v
+}
+
+define i32 @maskedLoad(ptr %from) {
+  %gc.stackobject = alloca { <2 x ptr>, i32 }, align 8
+  store { <2 x ptr>, i32 } zeroinitializer, ptr %gc.stackobject, align 8
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %pair = call <2 x ptr> @llvm.masked.load.v2p0.p0(ptr align 4 %from, <2 x i1> splat (i1 true), <2 x ptr> poison)
+  %1 = getelementptr { <2 x ptr>, i32 }, ptr %gc.stackobject, i32 0, i32 0
+  store <2 x ptr> %pair, ptr %1, align 8
+  call void @collect()
+  %p = extractelement <2 x ptr> %pair, i32 0
+  %v = load i32, ptr %p, align 4
+  %2 = getelementptr { <2 x ptr>, i32 }, ptr %gc.stackobject, i32 0, i32 1
+  store i32 %v, ptr %2, align 4
+  ret i32 %v
+}
+
+declare { <2 x ptr> } @vectorInStruct()
+
+define i32 @vectorField() {
+  %gc.stackobject = alloca { <2 x ptr>, i32 }, align 8
+  store { <2 x ptr>, i32 } zeroinitializer, ptr %gc.stackobject, align 8
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %s = call { <2 x ptr> } @vectorInStruct()
+  %1 = extractvalue { <2 x ptr> } %s, 0
+  %2 = getelementptr { <2 x ptr>, i32 }, ptr %gc.stackobject, i32 0, i32 0
+  store <2 x ptr> %1, ptr %2, align 8
+  call void @collect()
+  %pair = extractvalue { <2 x ptr> } %s, 0
+  %p = extractelement <2 x ptr> %pair, i32 0
+  %v = load i32, ptr %p, align 4
+  %3 = getelementptr { <2 x ptr>, i32 }, ptr %gc.stackobject, i32 0, i32 1
+  store i32 %v, ptr %3, align 4
+  ret i32 %v
+}
+
+define double @doubleField(ptr %from) {
+  %s = load { ptr, i32, double }, ptr %from, align 8
+  call void @collect()
+  %d = extractvalue { ptr, i32, double } %s, 2
+  %sum = fadd double %d, 1.000000e+00
+  ret double %sum
+}
+
+define i32 @stringShortened() {
+entry:
+  %gc.stackobject = alloca { ptr }, align 8
+  store { ptr } zeroinitializer, ptr %gc.stackobject, align 4
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %s = call { ptr, i32 } @makeString()
+  br label %loop
+
+loop:                                             ; preds = %loop, %entry
+  %cur = phi { ptr, i32 } [ %s, %entry ], [ %rest, %loop ]
+  %0 = extractvalue { ptr, i32 } %cur, 0
+  %1 = getelementptr { ptr }, ptr %gc.stackobject, i32 0, i32 0
+  store ptr %0, ptr %1, align 4
+  call void @collect()
+  %data = extractvalue { ptr, i32 } %cur, 0
+  %c = load i8, ptr %data, align 1
+  %len = extractvalue { ptr, i32 } %cur, 1
+  %len.next = sub i32 %len, 1
+  %rest = insertvalue { ptr, i32 } %cur, i32 %len.next, 1
+  %done = icmp eq i32 %len.next, 0
+  br i1 %done, label %end, label %loop
+
+end:                                              ; preds = %loop
+  ret i32 %len
+}
+
 define void @listWalk(ptr %head) {
 entry:
   %gc.stackobject = alloca { ptr }, align 8
@@ -899,9 +987,14 @@ define i32 @integerCopyReturnsTwice(ptr %from, ptr %buf) {
   ret i32 %v
 }
 
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: read)
+declare <2 x ptr> @llvm.masked.load.v2p0.p0(ptr nocapture, <2 x i1>, <2 x ptr>) #3
+
 declare void @tinygo_exposeStackObject(ptr)
 
 attributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }
 attributes #1 = { returns_twice }
+attributes #2 = { nocallback nofree nounwind speculatable willreturn memory(none) }
+attributes #3 = { nocallback nofree nounwind willreturn memory(argmem: read) }
 
 !0 = !{}

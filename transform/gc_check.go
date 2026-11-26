@@ -63,7 +63,7 @@ func (f *gcSlotFunc) checkSlots(live []llvm.Value) {
 		}
 		fields := pointerPaths(typ, nil, nil)
 		if f.intBits[value] {
-			fields = f.carrierPaths(typ, nil, fields)
+			fields = f.carrierPaths(typ, nil, fields, f.sure[value])
 		}
 		for _, field := range fields {
 			if !pathsOverlap(field, path) {
@@ -129,7 +129,7 @@ func (f *gcSlotFunc) checkSlots(live []llvm.Value) {
 			// Its slot holds what goes into it unchanged, unless it is
 			// a phi in a loop that steps through an object (see
 			// passesThrough).
-			chosen = !(f.isCyclicPhi(value) && f.selfDerived(value))
+			chosen = !f.operandsNeeded(value)
 		case chosen && !f.keepsValue(value):
 			// An address is computed on the way to the slot: what it is
 			// computed from has to be held.
