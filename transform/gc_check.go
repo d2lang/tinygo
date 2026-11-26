@@ -179,7 +179,22 @@ func (f *gcSlotFunc) checkSlots(live []llvm.Value) {
 				block = f.opBlock[slot]
 				at = f.blockStart[block+1]
 			}
-			walk(value, block, at, nil, f.collecting[sink] && f.hasPointer[value], false)
+			typ := f.insts[value].Type()
+			switch {
+			case !f.collecting[sink] || !f.hasPointer[value]:
+				walk(value, block, at, nil, false, false)
+			case typ.TypeKind() == llvm.PointerTypeKind:
+				// A pointer passed to a collecting call needs a slot during
+				// the call: the callee does not root its parameters.
+				walk(value, block, at, nil, true, false)
+			default:
+				// So do the pointers in an aggregate. Its integers do not:
+				// the callee takes them as integers.
+				walk(value, block, at, nil, false, false)
+				for _, path := range pointerPaths(typ, nil, nil) {
+					walk(value, block, at, path, true, false)
+				}
+			}
 		}
 	}
 }
