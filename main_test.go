@@ -1092,7 +1092,7 @@ func runGCRootsTest(options compileopts.Options, t *testing.T) {
 		t.Parallel()
 		runTest("gc-roots.go", options, t, nil, nil)
 	})
-	for _, name := range []string{"gc-roots.go", "gc-intcopy.go", "gc-liveness-repro.go", "gc.go", "gc-maplookup.go", "gc-retyped-global.go"} {
+	for _, name := range []string{"gc-roots.go", "gc-intcopy.go", "gc-identity.go", "gc-liveness-repro.go", "gc.go", "gc-maplookup.go", "gc-retyped-global.go"} {
 		for _, scheduler := range []string{"asyncify", "none"} {
 			t.Run(name+"-gc-stress-scheduler-"+scheduler, func(t *testing.T) {
 				t.Parallel()

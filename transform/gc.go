@@ -144,6 +144,7 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 		readNoneKind:  llvm.AttributeKindID("readnone"),
 		noCaptureKind: llvm.AttributeKindID(llvmutil.NoCaptureAttrName()),
 		twiceKind:     llvm.AttributeKindID("returns_twice"),
+		noPointerKind: ctx.MDKindID(noPointerMDName),
 	}
 	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
 		if fn.FirstBasicBlock().IsNil() {
@@ -180,6 +181,9 @@ type gcSlotPass struct {
 	prune        bool
 
 	noAliasKind, readOnlyKind, readNoneKind, noCaptureKind, twiceKind uint
+
+	// noPointerKind is the metadata kind of MarkNoPointerLoads.
+	noPointerKind int
 }
 
 // run gives fn its stack object.
@@ -406,9 +410,11 @@ const (
 //
 // "In use" covers every value the pointer can be found in: the values computed
 // from it without going through memory or a call (interior pointers, casts,
-// phis, selects, fields of aggregates, the integer after a conversion and what
-// is computed from that). The search stops at a value that has a slot decision
-// of its own, because its slot roots what is used through it.
+// phis, selects, fields of aggregates, the integer after a conversion and
+// whatever is computed from that, a comparison included). The search for what
+// a value in use is made of goes back to where its bits entered the function,
+// and that value gets the slot. It goes on past a conversion to a pointer and
+// past a phi in a loop, which get slots of their own, see passesThrough.
 //
 // The pointers that are looked at are not just the tracked ones but every
 // value that a load, a call, an integer conversion or a phi in a loop
@@ -418,16 +424,14 @@ const (
 // A pointer does not have to look like one. LLVM copies a small object (one or
 // two pointers, a string, an interface) as an integer of its size, and once
 // the variable it was copied to is gone that integer is the only thing that
-// has the pointers. So every integer of at least the size of a pointer that
-// a load or a call produces is taken for a possible pointer, along with what
-// the instructions that keep its bits together make of it, and whatever an
-// address is computed from is one for sure (carrier). Such an integer gets
-// a slot, as the integer it is (the collector reads the stack word by word),
-// if it is in use across a collecting call and that use delivers its bits:
-// makes an address of them, stores them, passes them to a call or returns
-// them. Comparing it or calculating with it does not. Passing it to the
-// collecting call itself does not count either: a function takes the
-// integers it is given for integers.
+// has the pointers. So the integers of at least the size of a pointer that
+// loads produce are taken for possible pointers (see findCarriers). They get
+// a slot, as the integers they are (the collector reads the stack word by
+// word), on the same terms as pointers: if they, or anything computed from
+// them, are in use across a collecting call, whatever the use is. A comparison
+// after a collection, for one, would find a new object at the address of the
+// old one. Being passed to the collecting call itself does not count for an
+// integer, though: a function takes the integers it is given for integers.
 //
 // The pass runs before link time optimization, and it is the final code that
 // has to obey the rule, not the code seen here. Stores and calls keep their
@@ -475,28 +479,17 @@ type gcSlotFunc struct {
 	calls         []int32 // the collecting calls
 
 	// hasPointer says that the type of the value contains a pointer. intBits
-	// says that a pointer may sit in it as an integer. fromHere says that the
-	// pointer was not handed to the function by its caller: a load or a call
-	// made it, or it is computed from the result of one.
-	//
-	// carrier says that the value is an integer, or has one in it, that may be
-	// a pointer nobody declared: LLVM copies a small object (a pointer or two,
-	// a string, an interface) as an integer of its size, and that integer is
-	// all that is left of the copy once the variable it went to is gone. Any
-	// integer of at least the size of a pointer that a load or a call
-	// produces is taken for one, and so is what the instructions that keep
-	// its bits make of it (see carrierOperands). Whatever an inttoptr is
-	// computed from is one for sure. delivers says that the bits of a carrier
-	// get somewhere a pointer can be used from or found again: an inttoptr,
-	// memory, a call or the caller. A carrier that is only compared or
-	// calculated with is never a pointer for anybody.
+	// says that a pointer may sit in it as an integer, or in an integer field
+	// of it (see findCarriers). fromHere says that the pointer was not handed
+	// to the function by its caller: a load or a call made it, or it is
+	// computed from the result of one.
 	hasPointer []bool
 	intBits    []bool
 	fromHere   []bool
-	carrier    []bool
-	delivers   []bool
 
-	// boundary marks the values at which the search for uses stops.
+	// boundary marks the values that may get a slot of their own. The search
+	// for what a pointer in use is made of stops at them, except where
+	// passesThrough says otherwise.
 	boundary []bool
 
 	// conservative is set for a function with something this analysis does
@@ -656,51 +649,6 @@ func (p *gcSlotPass) newSlotFunc(fn llvm.Value) *gcSlotFunc {
 		}
 	}
 
-	// Integers that may hold a pointer: the result of a conversion and what
-	// is computed from it, also as a field of an aggregate.
-	for changed := true; changed; {
-		changed = false
-		for i := range f.insts {
-			if !f.fromHere[i] {
-				here := f.kind[i] == slotOrigin
-				if f.kind[i] == slotFlow {
-					for slot := f.opStart[i]; slot < f.opStart[i+1]; slot++ {
-						if operand := f.ops[slot]; operand >= 0 && f.fromHere[operand] {
-							here = true
-						}
-					}
-				}
-				if here {
-					f.fromHere[i] = true
-					changed = true
-				}
-			}
-			if f.intBits[i] || f.kind[i] != slotFlow {
-				continue
-			}
-			var bits bool
-			switch f.opcode[i] {
-			case llvm.PtrToInt, opPtrToAddr:
-				bits = true
-			case llvm.IntToPtr, llvm.GetElementPtr:
-				// The result is a pointer again.
-			default:
-				if f.insts[i].Type().TypeKind() == llvm.PointerTypeKind {
-					break
-				}
-				for slot := f.opStart[i]; slot < f.opStart[i+1]; slot++ {
-					if operand := f.ops[slot]; operand >= 0 && f.intBits[operand] {
-						bits = true
-					}
-				}
-			}
-			if bits {
-				f.intBits[i] = true
-				changed = true
-			}
-		}
-	}
-
 	f.findCarriers()
 	return f
 }
@@ -719,51 +667,48 @@ func (f *gcSlotFunc) canCarry(typ llvm.Type) bool {
 		}
 	case llvm.ArrayTypeKind:
 		return typ.ArrayLength() != 0 && f.canCarry(typ.ElementType())
+	case llvm.VectorTypeKind:
+		// LLVM vectorizes nothing before this pass, but a vector of
+		// pointers or of such integers is kept like an integer.
+		elem := typ.ElementType()
+		return elem.TypeKind() == llvm.PointerTypeKind || f.canCarry(elem)
 	}
 	return false
 }
 
-// carrierOperands returns which operands (a range of indices into f.ops) an
-// instruction takes the bits of its result from, if it is one that keeps the
-// bits of an integer together: a pointer that goes in can be read from what
-// comes out. Arithmetic is not: nothing makes a sum from a copied pointer.
-func (f *gcSlotFunc) carrierOperands(i int32) (from, to int32) {
-	from, to = f.opStart[i], f.opStart[i+1]
-	switch f.opcode[i] {
-	case llvm.Trunc, llvm.ZExt, llvm.SExt, llvm.BitCast, opFreeze, llvm.Or, llvm.And,
-		llvm.PHI, llvm.InsertValue, llvm.ExtractValue:
-		return from, to
-	case llvm.Shl, llvm.LShr, llvm.AShr:
-		// Not the distance.
-		return from, from + 1
-	case llvm.Select:
-		return from + 1, to
-	case llvm.Call:
-		// A rotation is how LLVM swaps the halves of an integer.
-		if f.kind[i] == slotFlow {
-			name := f.insts[i].CalledValue().Name()
-			if strings.HasPrefix(name, "llvm.fshl.") || strings.HasPrefix(name, "llvm.fshr.") {
-				return from, from + 2
-			}
-		}
+// wholeSlot returns whether a value of this type, which is neither a pointer
+// nor an aggregate, is kept in a slot as it is if it may have a pointer in its
+// bits: whether it has room for one.
+func (f *gcSlotFunc) wholeSlot(typ llvm.Type) bool {
+	switch typ.TypeKind() {
+	case llvm.IntegerTypeKind, llvm.FloatTypeKind, llvm.DoubleTypeKind, llvm.VectorTypeKind:
+		return f.pass.targetData.TypeStoreSize(typ) >= uint64(f.pass.targetData.PointerSize())
 	}
-	return from, from
+	return false
 }
 
-// findCarriers finds the integers that may be a pointer without having been
-// made from one in this function (carrier), and those among them that are
-// put where a pointer can be taken from again (delivers).
+// findCarriers finds the values that may have a pointer in their integer
+// bits (intBits), and the values computed from something that a load or
+// a call in this function made (fromHere).
+//
+// A pointer gets into an integer by a conversion, or as one of the integers
+// LLVM copies small objects with (one or two pointers, a string, an
+// interface). So every integer of at least the size of a pointer that a load
+// or an atomic operation produces may be one, also as a field of an
+// aggregate, unless the load is marked as one of a value of a Go type without
+// pointers (see MarkNoPointerLoads). What a call returns is not: the result
+// types of functions are those of the Go source, which LLVM does not change
+// at the levels TinyGo optimizes at (argument promotion runs only at O3).
+// Whatever an address is computed from is a pointer for sure, whatever its
+// type and wherever it comes from. And whatever is computed from a value that
+// may have a pointer in it, through any calculation, may have its bits too.
 func (f *gcSlotFunc) findCarriers() {
 	n := int32(len(f.insts))
-	f.carrier = make([]bool, n)
-	f.delivers = make([]bool, n)
-
-	// What an address is computed from: through any calculation, back to
-	// where the integers come from.
+	sure := make([]bool, n)
 	f.stack = f.stack[:0]
 	mark := func(value int32) {
-		if value >= 0 && !f.carrier[value] && f.insts[value].Type().TypeKind() != llvm.PointerTypeKind {
-			f.carrier[value] = true
+		if value >= 0 && !sure[value] && f.insts[value].Type().TypeKind() != llvm.PointerTypeKind {
+			sure[value] = true
 			f.stack = append(f.stack, value)
 		}
 	}
@@ -787,40 +732,38 @@ func (f *gcSlotFunc) findCarriers() {
 		}
 	}
 
-	// What memory and calls hand out, and what keeps its bits.
 	for i := int32(0); i < n; i++ {
-		if f.kind[i] == slotOrigin && f.canCarry(f.insts[i].Type()) {
-			f.carrier[i] = true
+		switch {
+		case sure[i], f.opcode[i] == llvm.PtrToInt, f.opcode[i] == opPtrToAddr:
+			f.intBits[i] = true
+		case f.kind[i] == slotOrigin && f.opcode[i] != llvm.Call:
+			f.intBits[i] = f.canCarry(f.insts[i].Type()) && !f.noPointers(i)
 		}
 	}
 	for changed := true; changed; {
 		changed = false
 		for i := int32(0); i < n; i++ {
-			if f.carrier[i] || f.kind[i] != slotFlow {
-				continue
-			}
-			from, to := f.carrierOperands(i)
-			for slot := from; slot < to; slot++ {
-				if operand := f.ops[slot]; operand >= 0 && f.carrier[operand] {
-					if f.canCarry(f.insts[i].Type()) {
-						f.carrier[i] = true
-						changed = true
+			if !f.fromHere[i] {
+				here := f.kind[i] == slotOrigin
+				if f.kind[i] == slotFlow {
+					for slot := f.opStart[i]; slot < f.opStart[i+1]; slot++ {
+						if operand := f.ops[slot]; operand >= 0 && f.fromHere[operand] {
+							here = true
+						}
 					}
-					break
+				}
+				if here {
+					f.fromHere[i] = true
+					changed = true
 				}
 			}
-		}
-	}
-
-	for changed := true; changed; {
-		changed = false
-		for i := n - 1; i >= 0; i-- {
-			if !f.carrier[i] || f.delivers[i] {
+			if f.intBits[i] || f.kind[i] != slotFlow || f.insts[i].Type().TypeKind() == llvm.PointerTypeKind {
+				// A pointer again (inttoptr, getelementptr) is followed as one.
 				continue
 			}
-			for u := f.useStart[i]; u < f.useStart[i+1]; u++ {
-				if f.deliversTo(f.opInst[f.uses[u]]) {
-					f.delivers[i] = true
+			for slot := f.opStart[i]; slot < f.opStart[i+1]; slot++ {
+				if operand := f.ops[slot]; operand >= 0 && f.intBits[operand] && f.bitsFlow(slot) {
+					f.intBits[i] = true
 					changed = true
 					break
 				}
@@ -829,35 +772,80 @@ func (f *gcSlotFunc) findCarriers() {
 	}
 }
 
+// bitsFlow returns whether the bits of the operand in this slot can be found
+// in the result of the instruction it belongs to. All operands of a flow
+// instruction count, except the callee, the condition of a select (it only
+// chooses), and the distance of a shift.
+func (f *gcSlotFunc) bitsFlow(slot int32) bool {
+	user := f.opInst[slot]
+	switch f.opcode[user] {
+	case llvm.Select:
+		return slot != f.opStart[user]
+	case llvm.Shl, llvm.LShr, llvm.AShr:
+		return slot == f.opStart[user]
+	}
+	return !f.isCallee(slot)
+}
+
+// noPointers returns whether the instruction is a load that the front end
+// marked as one of a value of a Go type without pointers.
+func (f *gcSlotFunc) noPointers(i int32) bool {
+	return f.opcode[i] == llvm.Load && !f.insts[i].Metadata(f.pass.noPointerKind).IsNil()
+}
+
 // isIntegerAddress returns whether the instruction computes an address from
 // integers alone, the other way to write an inttoptr.
 func (f *gcSlotFunc) isIntegerAddress(i int32) bool {
 	return f.opcode[i] == llvm.GetElementPtr && f.insts[i].Operand(0).IsNull()
 }
 
-// deliversTo returns whether user, given a carrier, puts its bits where a
-// pointer can be used from or found again.
-func (f *gcSlotFunc) deliversTo(user int32) bool {
-	switch f.opcode[user] {
-	case llvm.IntToPtr, llvm.Store, llvm.Ret:
-		return true
-	case llvm.GetElementPtr:
-		return f.isIntegerAddress(user)
-	}
-	switch f.kind[user] {
-	case slotOrigin:
-		// An argument of a call, or the new value of an atomic operation.
-		return true
-	case slotFlow:
-		return f.carrier[user] && f.delivers[user]
-	}
-	return false
+// isSlotKind returns whether the instruction is one that may get a slot: one
+// that brings a value into the function (a load, a call, an atomic
+// operation), a conversion to a pointer, or a phi in a loop, whose value can
+// outlive the slot of the value that went in, which is overwritten on the way
+// round.
+func (f *gcSlotFunc) isSlotKind(i int32) bool {
+	return f.kind[i] == slotOrigin || f.opcode[i] == llvm.IntToPtr || f.isCyclicPhi(i)
 }
 
-// carriesInt is carries for a carrier: whether the bits of operand can end up
-// in user.
-func (f *gcSlotFunc) carriesInt(operand, user int32) bool {
-	return f.kind[user] == slotFlow && f.carrier[operand] && f.carrier[user]
+// isCyclicPhi returns whether the instruction is a phi in a loop.
+func (f *gcSlotFunc) isCyclicPhi(i int32) bool {
+	return f.opcode[i] == llvm.PHI && f.inCycle[f.blockOf[i]]
+}
+
+// passesThrough returns whether the search for what a pointer in use is made
+// of goes on past user, which has a slot: past a conversion to a pointer and
+// past a phi in a loop. Their value may point past the end of the object it
+// was computed from (a pointer that runs one element ahead, an address
+// computed in integers), and then only the slot of what it was computed from
+// keeps the object. So the search goes on as for a value that is chosen into
+// the slot (see keepsValue), and what an address is computed from on the way
+// is needed itself.
+func (f *gcSlotFunc) passesThrough(user int32) bool {
+	return f.opcode[user] == llvm.IntToPtr || f.isCyclicPhi(user)
+}
+
+// keepsValue returns whether the instruction passes a value on without
+// computing an address from it: a cast, a choice (a phi, a select), or
+// putting the value into an aggregate or taking it out. A getelementptr only
+// counts if all its offsets are zero. What a slot holds that way is the value
+// itself.
+func (f *gcSlotFunc) keepsValue(i int32) bool {
+	switch f.opcode[i] {
+	case llvm.PHI, llvm.Select, llvm.BitCast, opAddrSpaceCast, opFreeze, llvm.ExtractValue,
+		llvm.InsertValue, llvm.Trunc, llvm.ZExt, llvm.SExt, llvm.PtrToInt, opPtrToAddr, llvm.IntToPtr:
+		return true
+	case llvm.GetElementPtr:
+		inst := f.insts[i]
+		for j := 1; j < inst.OperandsCount(); j++ {
+			offset := inst.Operand(j)
+			if offset.IsAConstantInt().IsNil() || offset.ZExtValue() != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // blocksInCycles returns which blocks lie on a cycle, see blockInCycle.
@@ -930,9 +918,10 @@ func blocksInCycles(succs [][]int32) []bool {
 	return inCycle
 }
 
-// carries returns whether the pointer in operand can end up in user.
-func (f *gcSlotFunc) carries(operand, user int32) bool {
-	if f.kind[user] != slotFlow {
+// carries returns whether the pointer in operand, which user takes in this
+// slot, can end up in user.
+func (f *gcSlotFunc) carries(operand, user, slot int32) bool {
+	if f.kind[user] != slotFlow || !f.bitsFlow(slot) {
 		return false
 	}
 	if !f.hasPointer[operand] && !f.intBits[operand] {
@@ -951,9 +940,11 @@ func (f *gcSlotFunc) isCallee(slot int32) bool {
 
 // liveAtCollection returns whether value is in use when a collecting call is
 // made or when it returns, looking only at the uses that skip does not reject.
-// With ints set it asks this for value as a carrier: only the uses that
-// deliver its bits count.
-func (f *gcSlotFunc) liveAtCollection(value int32, skip func(user int32) bool, ints bool) bool {
+// With args set, being an argument of the collecting call counts too: the
+// callee does not root its parameters, the caller does. That goes for
+// pointers, not for integers: an integer that a function is given is an
+// integer to it.
+func (f *gcSlotFunc) liveAtCollection(value int32, skip func(user int32) bool, args bool) bool {
 	f.stampID++
 	f.stack = f.stack[:0]
 	defBlock := f.blockOf[value]
@@ -981,11 +972,7 @@ func (f *gcSlotFunc) liveAtCollection(value int32, skip func(user int32) bool, i
 		if skip != nil && skip(user) {
 			continue
 		}
-		if ints {
-			if !f.deliversTo(user) {
-				continue
-			}
-		} else if f.opcode[user] == llvm.ExtractValue && !f.hasPointer[user] && !f.intBits[user] {
+		if f.opcode[user] == llvm.ExtractValue && !f.hasPointer[user] && !f.intBits[user] {
 			// This takes a field without a pointer out of an aggregate.
 			continue
 		}
@@ -996,10 +983,7 @@ func (f *gcSlotFunc) liveAtCollection(value int32, skip func(user int32) bool, i
 			}
 			continue
 		}
-		if f.collecting[user] && !f.isCallee(slot) && !ints {
-			// The callee does not root its parameters. That goes for
-			// pointers: an integer that a function is given is an integer
-			// to it, so one that is passed on is delivered by then.
+		if args && f.collecting[user] && !f.isCallee(slot) {
 			return true
 		}
 		block := f.blockOf[user]
@@ -1145,21 +1129,39 @@ func pointerPaths(typ llvm.Type, prefix []uint32, paths [][]uint32) [][]uint32 {
 func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 	f.findVariables()
 	if f.conservative {
-		// Every tracked pointer, and every integer that may be a pointer
-		// and is delivered somewhere.
+		// Every tracked pointer, and every other value that may bring
+		// a pointer into the function, in use at a collecting call or not.
+		have := make(map[llvm.Value]struct{}, len(tracked))
+		for _, ptr := range tracked {
+			have[ptr] = struct{}{}
+		}
+		add := func(value llvm.Value) {
+			if _, ok := have[value]; !ok {
+				have[value] = struct{}{}
+				tracked = append(tracked, value)
+			}
+		}
 		for i, inst := range f.insts {
-			if !f.delivers[i] || f.kind[i] != slotOrigin && f.opcode[i] != llvm.PHI {
+			if !f.isSlotKind(int32(i)) || !f.hasPointer[i] && !f.intBits[i] {
 				continue
 			}
 			typ := inst.Type()
-			if typ.TypeKind() == llvm.IntegerTypeKind {
-				if f.canCarry(typ) {
-					tracked = append(tracked, inst)
+			switch typ.TypeKind() {
+			case llvm.PointerTypeKind:
+				add(inst)
+			case llvm.StructTypeKind, llvm.ArrayTypeKind:
+				for _, path := range pointerPaths(typ, nil, nil) {
+					add(f.extractField(int32(i), path))
 				}
-				continue
-			}
-			for _, path := range f.carrierPaths(typ, nil, nil) {
-				tracked = append(tracked, f.extractField(int32(i), path))
+				if f.intBits[i] {
+					for _, path := range f.carrierPaths(typ, nil, nil) {
+						add(f.extractField(int32(i), path))
+					}
+				}
+			default:
+				if f.wholeSlot(typ) {
+					add(inst)
+				}
 			}
 		}
 		return tracked
@@ -1197,17 +1199,8 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 		addSlot(def, agg, path, false)
 	}
 	for i, inst := range f.insts {
-		ints := f.carrier[i] || f.intBits[i]
-		if !f.hasPointer[i] && !ints {
-			continue
-		}
-		switch {
-		case f.kind[i] == slotOrigin:
-		case f.opcode[i] == llvm.IntToPtr:
-		case f.opcode[i] == llvm.PHI && f.inCycle[f.blockOf[i]]:
-			// The value of a phi in a loop can outlive the slot of the value
-			// that went in, which is overwritten on the way round.
-		default:
+		ints := f.intBits[i]
+		if !f.hasPointer[i] && !ints || !f.isSlotKind(int32(i)) {
 			continue
 		}
 		typ := inst.Type()
@@ -1215,10 +1208,12 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 		case llvm.PointerTypeKind:
 			addSlot(int32(i), -1, nil, false)
 			continue
-		case llvm.IntegerTypeKind:
-			// The slot takes the integer as it is: the collector reads
-			// the stack word by word.
-			if f.canCarry(typ) {
+		case llvm.StructTypeKind, llvm.ArrayTypeKind:
+		default:
+			// An integer, or another value that an address is computed
+			// from. The slot takes it as it is: the collector reads the
+			// stack word by word.
+			if f.wholeSlot(typ) {
 				addSlot(int32(i), -1, nil, true)
 			}
 			continue
@@ -1239,55 +1234,63 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 	// needed[v] says that v, or something computed from v up to the next
 	// value with a slot of its own, is in use at a collecting call.
 	//
-	// neededInt[v] says that for a carrier: v, or something that has its bits,
-	// is at a collecting call on its way to where it is delivered.
-	needed := make([]bool, len(f.insts))
-	neededInt := make([]bool, len(f.insts))
-	var worklist, worklistInt []int32
-	for i := range f.insts {
-		if (f.hasPointer[i] || f.intBits[i]) && f.liveAtCollection(int32(i), nil, false) {
+	// chosen[v] says that v goes unchanged (see keepsValue) into a value with
+	// a slot that the search passes through (see passesThrough). That slot
+	// holds v, so v needs no slot for that, but what an address is computed
+	// from on the way there is needed.
+	n := int32(len(f.insts))
+	needed := make([]bool, n)
+	chosen := make([]bool, n)
+	var worklist []int32 // a value, or -1-value for one that is chosen
+	for i := int32(0); i < n; i++ {
+		if (f.hasPointer[i] || f.intBits[i]) && f.liveAtCollection(i, nil, f.hasPointer[i]) {
 			needed[i] = true
-			worklist = append(worklist, int32(i))
+			worklist = append(worklist, i)
 		}
-		if f.delivers[i] && f.liveAtCollection(int32(i), nil, true) {
-			neededInt[i] = true
-			worklistInt = append(worklistInt, int32(i))
+	}
+	push := func(value int32, asChosen bool) {
+		switch {
+		case needed[value]:
+		case !asChosen:
+			needed[value] = true
+			worklist = append(worklist, value)
+		case !chosen[value]:
+			chosen[value] = true
+			worklist = append(worklist, -1-value)
 		}
 	}
 	for len(worklist) != 0 {
 		user := worklist[len(worklist)-1]
 		worklist = worklist[:len(worklist)-1]
-		if f.boundary[user] {
-			continue
-		}
-		integerAddress := f.isIntegerAddress(user)
-		for slot := f.opStart[user]; slot < f.opStart[user+1]; slot++ {
-			operand := f.ops[slot]
-			if operand < 0 {
+		isChosen := user < 0
+		if isChosen {
+			user = -1 - user
+			if needed[user] {
+				// Followed as needed instead.
 				continue
 			}
-			if !needed[operand] && f.carries(operand, user) && !f.isCallee(slot) {
-				needed[operand] = true
-				worklist = append(worklist, operand)
-			}
-			if integerAddress && !neededInt[operand] && f.carrier[operand] {
-				neededInt[operand] = true
-				worklistInt = append(worklistInt, operand)
-			}
 		}
-	}
-	for len(worklistInt) != 0 {
-		user := worklistInt[len(worklistInt)-1]
-		worklistInt = worklistInt[:len(worklistInt)-1]
-		if f.boundary[user] {
-			continue
+		var asChosen bool
+		switch {
+		case isChosen:
+			asChosen = f.keepsValue(user)
+		case f.boundary[user]:
+			if !f.passesThrough(user) {
+				// The slot of user roots what is used through it.
+				continue
+			}
+			asChosen = true
 		}
 		for slot := f.opStart[user]; slot < f.opStart[user+1]; slot++ {
 			operand := f.ops[slot]
-			if operand >= 0 && !neededInt[operand] && f.carriesInt(operand, user) && !f.isCallee(slot) {
-				neededInt[operand] = true
-				worklistInt = append(worklistInt, operand)
+			if operand < 0 || !f.carries(operand, user, slot) {
+				continue
 			}
+			if asChosen && f.kind[operand] == slotOrigin {
+				// The slot user's value goes into holds it.
+				continue
+			}
+			push(operand, asChosen)
 		}
 	}
 
@@ -1308,32 +1311,32 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 		}
 	}
 	fieldNeeded := func(agg int32, path []uint32, ints bool) bool {
+		if ints && !f.intBits[agg] {
+			return false
+		}
 		skip := otherField(agg, path)
-		// An integer field is looked at as a carrier, and like a pointer if
-		// it may have been made from one.
-		asPointer := !ints || f.intBits[agg]
-		asCarrier := ints && f.carrier[agg]
 		for u := f.useStart[agg]; u < f.useStart[agg+1]; u++ {
-			user := f.opInst[f.uses[u]]
-			if f.boundary[user] || skip(user) {
+			slot := f.uses[u]
+			user := f.opInst[slot]
+			if skip(user) || f.boundary[user] {
+				// Its slot roots the field. A value with a slot that the
+				// search passes through holds it as well, see chosen.
 				continue
 			}
-			if asPointer && needed[user] && f.carries(agg, user) {
-				return true
-			}
-			if asCarrier && neededInt[user] && f.carriesInt(agg, user) {
+			if needed[user] && f.carries(agg, user, slot) {
 				return true
 			}
 		}
-		return asPointer && f.liveAtCollection(agg, skip, false) ||
-			asCarrier && f.liveAtCollection(agg, skip, true)
+		// An integer field that is passed to a collecting call is an integer
+		// to the callee.
+		return f.liveAtCollection(agg, skip, !ints)
 	}
 
 	var live []llvm.Value
 	for _, slot := range slots {
 		switch {
 		case slot.def >= 0:
-			if needed[slot.def] || neededInt[slot.def] {
+			if needed[slot.def] {
 				live = append(live, slot.value)
 			}
 		case fieldNeeded(slot.agg, slot.path, slot.ints):
@@ -1341,7 +1344,7 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 		}
 	}
 	if GCSlotCheck != nil {
-		f.checkCarriers(live)
+		f.checkSlots(live)
 	}
 	return live
 }
@@ -1607,10 +1610,12 @@ func (f *gcSlotFunc) mayBePointer(value llvm.Value) bool {
 	}
 	// LLVM copies small objects as integers.
 	switch f.opcode[idx] {
-	case llvm.Load, opAtomicRMW, opAtomicCmpXchg, llvm.VAArg:
+	case llvm.Load:
+		return !f.noPointers(idx) || f.intBits[idx]
+	case opAtomicRMW, opAtomicCmpXchg, llvm.VAArg:
 		return true
 	}
-	return f.conservative || f.intBits[idx] || f.carrier[idx]
+	return f.conservative || f.intBits[idx]
 }
 
 // exposeStackObjectName is the function that every function with a stack

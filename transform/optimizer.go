@@ -45,6 +45,9 @@ func Optimize(mod llvm.Module, config *compileopts.Config) []error {
 		return errs
 	}
 
+	// Before LLVM makes loads of its own: see MakeGCStackSlots.
+	MarkNoPointerLoads(mod)
+
 	// run a check of all of our code
 	if config.VerifyIR() {
 		errs := ircheck.Module(mod)

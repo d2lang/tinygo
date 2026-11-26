@@ -449,7 +449,8 @@ define i32 @integerCopy(ptr %from) {
   ret i32 %v
 }
 
-; The integer is never a pointer here: it goes back to memory as it is.
+; The integer goes back to memory as it is, where it is a pointer again for
+; whoever loads it.
 define void @integerCopyStored(ptr %from, ptr %to) {
   %both = load i64, ptr %from
   call void @collect()
@@ -488,8 +489,8 @@ define i32 @integerSum(ptr %from) {
   ret i32 %v
 }
 
-; An integer that is passed on or returned after the call may be a pointer to
-; whoever gets it.
+; An integer that is passed on after the call may be a pointer to whoever gets
+; it. What a call returns is an integer in Go as well.
 define i32 @integerPassedOn(ptr %from) {
   %n = load i32, ptr %from
   %m = call i32 @leaf(ptr %from)
@@ -498,9 +499,9 @@ define i32 @integerPassedOn(ptr %from) {
   ret i32 %m
 }
 
-; An integer that is only calculated with or compared is not a pointer for
-; anybody, and neither is one that is passed on before anything collects.
-define i32 @integerNotDelivered(ptr %from) {
+; An integer that is only calculated with or compared after the call is in
+; use as well. One that is passed on before anything collects is not.
+define i32 @integerCalculated(ptr %from) {
   %n = load i32, ptr %from
   %m = load i32, ptr %from
   call void @takesInteger(i32 %m)
@@ -509,6 +510,107 @@ define i32 @integerNotDelivered(ptr %from) {
   %big = icmp ugt i32 %n, 10
   %r = select i1 %big, i32 %sum, i32 0
   ret i32 %r
+}
+
+; Two pointers copied as integers and compared after a collection: if the
+; first object was freed, a new one at its address would compare equal.
+define i1 @integerIdentity(ptr %a, ptr %b) {
+  %old = load i32, ptr %a
+  store ptr null, ptr %a
+  call void @collect()
+  %new = load i32, ptr %b
+  %same = icmp eq i32 %old, %new
+  ret i1 %same
+}
+
+; Arithmetic on the integer after the call does not make it any less
+; a pointer: here it becomes an interior address that is stored for later.
+define void @integerOffsetStored(ptr %from, ptr %to) {
+  %n = load i32, ptr %from
+  call void @collect()
+  %m = add i32 %n, 4
+  store i32 %m, ptr %to
+  ret void
+}
+
+; A load that the front end marked as one of a value of a Go type without
+; pointers reads no pointer.
+define i32 @integerNoPointers(ptr %from) {
+  %n = load i32, ptr %from, !tinygo.noptr !0
+  call void @collect()
+  %sum = add i32 %n, 1
+  ret i32 %sum
+}
+
+; Unless an address is computed from it.
+define i32 @integerNoPointersAddress(ptr %from) {
+  %n = load i32, ptr %from, !tinygo.noptr !0
+  call void @collect()
+  %p = inttoptr i32 %n to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+declare void @collectWithInteger(i32)
+
+; An integer given to the collecting call itself is an integer to the callee.
+define void @integerArgument(ptr %from) {
+  %n = load i32, ptr %from
+  call void @collectWithInteger(i32 %n)
+  ret void
+}
+
+; Whatever an address is computed from is kept as it is, a double included.
+define i32 @doubleAddress(ptr %from) {
+  %d = load double, ptr %from
+  call void @collect()
+  %bits = bitcast double %d to i64
+  %low = trunc i64 %bits to i32
+  %p = inttoptr i32 %low to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; A pointer that runs one element ahead points past the end of the object in
+; the last round, so the slot of the phi does not keep the object then. The
+; pointer it was computed from needs a slot as well.
+define i32 @pointerAhead(ptr %from, i32 %n) {
+entry:
+  %base = load ptr, ptr %from
+  %first = getelementptr i8, ptr %base, i32 4
+  br label %loop
+
+loop:
+  %ahead = phi ptr [ %first, %entry ], [ %next, %loop ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop ]
+  call void @collect()
+  %elem = getelementptr i8, ptr %ahead, i32 -4
+  %v = load i32, ptr %elem
+  %next = getelementptr i8, ptr %ahead, i32 4
+  %i.next = add i32 %i, 1
+  %done = icmp eq i32 %i.next, %n
+  br i1 %done, label %end, label %loop
+
+end:
+  ret i32 %v
+}
+
+; A phi that only chooses among the pointers that loads made holds the one
+; in use: the loads need no slots of their own.
+define void @listWalk(ptr %head) {
+entry:
+  %first = load ptr, ptr %head
+  br label %loop
+
+loop:
+  %node = phi ptr [ %first, %entry ], [ %next, %loop ]
+  call void @collectWith(ptr %node)
+  %next = load ptr, ptr %node
+  %end = icmp eq ptr %next, null
+  br i1 %end, label %done, label %loop
+
+done:
+  ret void
 }
 
 ; An integer that is carried round a loop outlives the slot of the load.
@@ -538,8 +640,9 @@ define i32 @integerOnStack(ptr %from) {
   ret i32 %v
 }
 
-; Where the pass cannot follow what happens it keeps every such integer that
-; is delivered, as it keeps every tracked pointer.
+; Where the pass cannot follow what happens it keeps every value that may
+; bring a pointer into the function, in use or not, as it keeps every tracked
+; pointer.
 define i32 @integerCopyReturnsTwice(ptr %from, ptr %buf) {
   %both = load i64, ptr %from
   %again = call i32 @setjmp(ptr %buf)
@@ -549,3 +652,5 @@ define i32 @integerCopyReturnsTwice(ptr %from, ptr %buf) {
   %v = load i32, ptr %p
   ret i32 %v
 }
+
+!0 = !{}
