@@ -1,9 +1,10 @@
 name: D2 release
 
-# Builds the compiler tarballs that D2's CI and developers install. Pushing a
-# tag like v0.44.0-d2.1 publishes them as a GitHub release; a manual run only
-# builds them (and fills the LLVM cache, which tag builds can then read
-# because this branch is the repository's default).
+# Builds the Linux x86-64 compiler tarball that D2's CI installs. Pushing a tag
+# like v0.44.0-d2.2 publishes it as a GitHub release; a manual run only builds
+# it (and fills the LLVM cache, which tag builds can then read because this
+# branch is the repository's default). There is no macOS build: GitHub never
+# had a runner for it here, and developers on a Mac build the fork from source.
 on:
   workflow_dispatch:
   push:
@@ -115,57 +116,27 @@ jobs:
           path: tinygo${{ steps.version.outputs.version }}.linux-amd64.tar.gz
           archive: false
 
-  darwin-arm64:
-    runs-on: macos-15
-    steps:
-      - name: Install Dependencies
-        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install binaryen
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          submodules: true
-      - name: Extract TinyGo version
-        id: version
-        run: ./.github/workflows/tinygo-extract-version.sh | tee -a "$GITHUB_OUTPUT"
-      - name: Install Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.27.1'
-          cache: true
-      - uses: ./.github/actions/setup-llvm-macos
-        with:
-          os: macos-15
-      - name: make gen-device
-        run: make -j3 gen-device
-      - name: Build TinyGo release tarball
-        run: |
-          make release -j3
-          cp -p build/release.tar.gz tinygo${{ steps.version.outputs.version }}.darwin-arm64.tar.gz
-      - name: Upload tarball
-        uses: actions/upload-artifact@v7
-        with:
-          name: tinygo${{ steps.version.outputs.version }}.darwin-arm64.tar.gz
-          path: tinygo${{ steps.version.outputs.version }}.darwin-arm64.tar.gz
-          archive: false
-
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux-amd64, darwin-arm64]
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    needs: [linux-amd64]
     runs-on: ubuntu-latest
     steps:
-      - name: Download tarballs
+      - name: Download tarball
         uses: actions/download-artifact@v8
         with:
+          name: tinygo${{ needs.linux-amd64.outputs.version }}.linux-amd64.tar.gz
           path: dist
-          merge-multiple: true
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
-          sha256sum tinygo*.tar.gz > SHA256SUMS
-          cat SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "TinyGo $GITHUB_REF_NAME" \
-            --notes "TinyGo ${{ needs.linux-amd64.outputs.version }} as D2 builds its WebAssembly module with it. See README-D2.md on the d2 branch for what differs from upstream." \
-            tinygo*.tar.gz SHA256SUMS
+          sha256sum tinygo*.tar.gz
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber tinygo*.tar.gz
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "TinyGo $GITHUB_REF_NAME" \
+              --notes "TinyGo ${{ needs.linux-amd64.outputs.version }} as D2 builds its WebAssembly module with it. See README-D2.md on the d2 branch for what differs from upstream. Each asset's SHA-256 is shown next to it." \
+              tinygo*.tar.gz
+          fi

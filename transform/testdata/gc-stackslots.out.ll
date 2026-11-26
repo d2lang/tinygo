@@ -7,7 +7,11 @@ target triple = "wasm32-unknown-unknown-wasm"
 @structGlobal = global { ptr, i32, [2 x ptr] } zeroinitializer
 @ptrArrayGlobal = global [8 x ptr] zeroinitializer
 @constantPtrGlobal = constant ptr @someGlobal
-@runtime.gcGlobalRoots = internal constant [4 x { ptr, i32 }] [{ ptr, i32 } { ptr @ptrGlobal, i32 4 }, { ptr, i32 } { ptr @structGlobal, i32 4 }, { ptr, i32 } { ptr getelementptr (i8, ptr @structGlobal, i32 8), i32 8 }, { ptr, i32 } { ptr @ptrArrayGlobal, i32 32 }]
+@retypedGlobal = global i64 0
+@retypedSingleGlobal = global i32 0
+@smallIntGlobal = global i16 0
+@floatGlobal = global double 0.000000e+00
+@runtime.gcGlobalRoots = internal constant [6 x { ptr, i32 }] [{ ptr, i32 } { ptr @ptrGlobal, i32 4 }, { ptr, i32 } { ptr @structGlobal, i32 4 }, { ptr, i32 } { ptr getelementptr (i8, ptr @structGlobal, i32 8), i32 8 }, { ptr, i32 } { ptr @ptrArrayGlobal, i32 32 }, { ptr, i32 } { ptr @retypedGlobal, i32 8 }, { ptr, i32 } { ptr @retypedSingleGlobal, i32 4 }]
 
 declare void @runtime.trackPointer(ptr nocapture readonly)
 
@@ -15,12 +19,12 @@ declare noalias nonnull ptr @runtime.alloc(i32, ptr)
 
 define i32 @runtime.gcGlobalRootCount() {
 entry:
-  ret i32 4
+  ret i32 6
 }
 
 define ptr @runtime.gcGlobalRoot(i32 %0) {
 entry:
-  %1 = getelementptr inbounds [4 x { ptr, i32 }], ptr @runtime.gcGlobalRoots, i32 0, i32 %0
+  %1 = getelementptr inbounds [6 x { ptr, i32 }], ptr @runtime.gcGlobalRoots, i32 0, i32 %0
   %2 = getelementptr inbounds nuw { ptr, i32 }, ptr %1, i32 0, i32 0
   %3 = load ptr, ptr %2, align 4
   ret ptr %3
@@ -28,7 +32,7 @@ entry:
 
 define i32 @runtime.gcGlobalRootSize(i32 %0) {
 entry:
-  %1 = getelementptr inbounds [4 x { ptr, i32 }], ptr @runtime.gcGlobalRoots, i32 0, i32 %0
+  %1 = getelementptr inbounds [6 x { ptr, i32 }], ptr @runtime.gcGlobalRoots, i32 0, i32 %0
   %2 = getelementptr inbounds nuw { ptr, i32 }, ptr %1, i32 0, i32 1
   %3 = load i32, ptr %2, align 4
   ret i32 %3
