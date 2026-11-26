@@ -43,6 +43,15 @@ Since then, for size and correctness:
   it is only ever copied whole. `-tags=gc.stress` builds a collector that
   makes such bugs show: it collects at every allocation and poisons what it
   frees.
+- A pointer gets a slot in its function's stack object only while
+  a collection can find it in use, instead of every tracked pointer for the
+  whole function. The integers LLVM copies small objects with count like
+  pointers, whatever they are used for; the loads the compiler makes of Go
+  values without pointers are marked so that their integers do not; and
+  a pointer that steps through an object keeps where it started in a slot.
+  D2's module is 5% smaller. The rule, and what it assumes of code that uses
+  package unsafe, are in transform/gc.go; with `transform.GCSlotCheck` set
+  the pass checks itself.
 
 Releases are tagged `v<upstream version>-d2.<n>` and built by
 `.github/workflows/d2-release.yml`.
