@@ -673,6 +673,127 @@ end:                                              ; preds = %loop
   ret i32 %v
 }
 
+define i32 @pointerStepsFromStart() {
+entry:
+  %gc.stackobject = alloca { ptr, ptr }, align 8
+  store { ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %base = call ptr @runtime.alloc(i32 16, ptr null)
+  %0 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
+  store ptr %base, ptr %0, align 4
+  br label %loop
+
+loop:                                             ; preds = %loop, %entry
+  %q = phi ptr [ %base, %entry ], [ %next, %loop ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop ]
+  %1 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
+  store ptr %q, ptr %1, align 4
+  call void @collect()
+  %behind = getelementptr i8, ptr %q, i32 -12
+  %v = load i32, ptr %behind, align 4
+  %next = getelementptr i8, ptr %q, i32 4
+  %i.next = add i32 %i, 1
+  %done = icmp eq i32 %i.next, 8
+  br i1 %done, label %end, label %loop
+
+end:                                              ; preds = %loop
+  ret i32 %v
+}
+
+define i32 @integerStepsFromLoad(ptr %from) {
+entry:
+  %gc.stackobject = alloca { i32, i32 }, align 8
+  store { i32, i32 } zeroinitializer, ptr %gc.stackobject, align 4
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %x = load i32, ptr %from, align 4
+  %0 = getelementptr { i32, i32 }, ptr %gc.stackobject, i32 0, i32 0
+  store i32 %x, ptr %0, align 4
+  br label %loop
+
+loop:                                             ; preds = %loop, %entry
+  %ip = phi i32 [ %x, %entry ], [ %ip.next, %loop ]
+  %1 = getelementptr { i32, i32 }, ptr %gc.stackobject, i32 0, i32 1
+  store i32 %ip, ptr %1, align 4
+  call void @collect()
+  %addr = add i32 %ip, -4
+  %p = inttoptr i32 %addr to ptr
+  %v = load i32, ptr %p, align 4
+  %ip.next = add i32 %ip, 4
+  %done = icmp eq i32 %v, 0
+  br i1 %done, label %end, label %loop
+
+end:                                              ; preds = %loop
+  ret i32 %v
+}
+
+define i32 @trackedEnd(i1 %c, ptr %other) {
+  %gc.stackobject = alloca { ptr, ptr }, align 8
+  store { ptr, ptr } zeroinitializer, ptr %gc.stackobject, align 4
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %base = call ptr @runtime.alloc(i32 16, ptr null)
+  %1 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 1
+  store ptr %base, ptr %1, align 4
+  %end = getelementptr i8, ptr %base, i32 16
+  %p = select i1 %c, ptr %end, ptr %other
+  %2 = getelementptr { ptr, ptr }, ptr %gc.stackobject, i32 0, i32 0
+  store ptr %p, ptr %2, align 4
+  call void @collect()
+  %last = getelementptr i8, ptr %p, i32 -4
+  %v = load i32, ptr %last, align 4
+  ret i32 %v
+}
+
+declare { i32, double } @makePair()
+
+define i32 @doubleFieldAddress(ptr %from) {
+  %gc.stackobject = alloca { double }, align 8
+  store { double } zeroinitializer, ptr %gc.stackobject, align 8
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %pair = load { i32, double }, ptr %from, align 8
+  %1 = extractvalue { i32, double } %pair, 1
+  %2 = getelementptr { double }, ptr %gc.stackobject, i32 0, i32 0
+  store double %1, ptr %2, align 8
+  call void @collect()
+  %d = extractvalue { i32, double } %pair, 1
+  %bits = bitcast double %d to i64
+  %low = trunc i64 %bits to i32
+  %p = inttoptr i32 %low to ptr
+  %v = load i32, ptr %p, align 4
+  ret i32 %v
+}
+
+define i32 @floatRoundTrip(ptr %from) {
+  %gc.stackobject = alloca { i32 }, align 8
+  store { i32 } zeroinitializer, ptr %gc.stackobject, align 4
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %n = load i32, ptr %from, align 4
+  %1 = getelementptr { i32 }, ptr %gc.stackobject, i32 0, i32 0
+  store i32 %n, ptr %1, align 4
+  %d = uitofp i32 %n to double
+  call void @collect()
+  %m = fptoui double %d to i32
+  %p = inttoptr i32 %m to ptr
+  %v = load i32, ptr %p, align 4
+  ret i32 %v
+}
+
+declare <2 x ptr> @twoPointers()
+
+define i32 @vectorResult() {
+  %gc.stackobject = alloca { <2 x ptr>, i32 }, align 8
+  store { <2 x ptr>, i32 } zeroinitializer, ptr %gc.stackobject, align 8
+  call void @tinygo_exposeStackObject(ptr %gc.stackobject)
+  %pair = call <2 x ptr> @twoPointers()
+  %1 = getelementptr { <2 x ptr>, i32 }, ptr %gc.stackobject, i32 0, i32 0
+  store <2 x ptr> %pair, ptr %1, align 8
+  call void @collect()
+  %p = extractelement <2 x ptr> %pair, i32 0
+  %v = load i32, ptr %p, align 4
+  %2 = getelementptr { <2 x ptr>, i32 }, ptr %gc.stackobject, i32 0, i32 1
+  store i32 %v, ptr %2, align 4
+  ret i32 %v
+}
+
 define void @listWalk(ptr %head) {
 entry:
   %gc.stackobject = alloca { ptr }, align 8

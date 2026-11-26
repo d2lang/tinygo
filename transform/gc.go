@@ -144,7 +144,7 @@ func MakeGCStackSlots(mod llvm.Module) bool {
 		readNoneKind:  llvm.AttributeKindID("readnone"),
 		noCaptureKind: llvm.AttributeKindID(llvmutil.NoCaptureAttrName()),
 		twiceKind:     llvm.AttributeKindID("returns_twice"),
-		noPointerKind: ctx.MDKindID(noPointerMDName),
+		noPointerKind: ctx.MDKindID(llvmutil.NoPointerMDName),
 	}
 	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
 		if fn.FirstBasicBlock().IsNil() {
@@ -182,7 +182,7 @@ type gcSlotPass struct {
 
 	noAliasKind, readOnlyKind, readNoneKind, noCaptureKind, twiceKind uint
 
-	// noPointerKind is the metadata kind of MarkNoPointerLoads.
+	// noPointerKind is the metadata kind of llvmutil.NoPointerMDName.
 	noPointerKind int
 }
 
@@ -499,6 +499,9 @@ type gcSlotFunc struct {
 	// variables are the stack variables that have to be exposed.
 	variables []llvm.Value
 
+	// derivedPhis remembers what selfDerived found.
+	derivedPhis map[int32]bool
+
 	stamp   []int32
 	stampID int32
 	stack   []int32
@@ -580,6 +583,9 @@ func (p *gcSlotPass) newSlotFunc(fn llvm.Value) *gcSlotFunc {
 		default:
 			// A vector, perhaps of pointers.
 			f.conservative = true
+			if typ.TypeKind() == llvm.VectorTypeKind && typ.ElementType().TypeKind() == llvm.PointerTypeKind {
+				f.hasPointer[i] = true
+			}
 		}
 
 		switch op {
@@ -587,7 +593,11 @@ func (p *gcSlotPass) newSlotFunc(fn llvm.Value) *gcSlotFunc {
 			llvm.IntToPtr, llvm.Trunc, llvm.ZExt, llvm.SExt, llvm.PHI, llvm.Select,
 			llvm.ExtractValue, llvm.InsertValue, llvm.ExtractElement, llvm.InsertElement,
 			llvm.ShuffleVector, opFreeze, llvm.Add, llvm.Sub, llvm.Mul, llvm.UDiv, llvm.SDiv,
-			llvm.URem, llvm.SRem, llvm.Shl, llvm.LShr, llvm.AShr, llvm.And, llvm.Or, llvm.Xor:
+			llvm.URem, llvm.SRem, llvm.Shl, llvm.LShr, llvm.AShr, llvm.And, llvm.Or, llvm.Xor,
+			// The bits of an integer can go through a float and come back:
+			// a pointer of 32 bits fits a double exactly.
+			llvm.FAdd, llvm.FSub, llvm.FMul, llvm.FDiv, llvm.FRem, opFNeg,
+			llvm.FPToUI, llvm.FPToSI, llvm.UIToFP, llvm.SIToFP, llvm.FPTrunc, llvm.FPExt:
 			f.kind[i] = slotFlow
 		case llvm.Load, opAtomicRMW, opAtomicCmpXchg, llvm.VAArg:
 			f.kind[i] = slotOrigin
@@ -613,8 +623,7 @@ func (p *gcSlotPass) newSlotFunc(fn llvm.Value) *gcSlotFunc {
 				// Control can come back to this call from any later one.
 				f.conservative = true
 			}
-		case llvm.ICmp, llvm.FCmp, llvm.FAdd, llvm.FSub, llvm.FMul, llvm.FDiv, llvm.FRem, opFNeg,
-			llvm.FPToUI, llvm.FPToSI, llvm.UIToFP, llvm.SIToFP, llvm.FPTrunc, llvm.FPExt,
+		case llvm.ICmp, llvm.FCmp,
 			llvm.Alloca, llvm.Store, opFence, llvm.Ret, opBr, llvm.Switch, llvm.IndirectBr,
 			llvm.Unreachable:
 			f.kind[i] = slotUses
@@ -695,13 +704,22 @@ func (f *gcSlotFunc) wholeSlot(typ llvm.Type) bool {
 // LLVM copies small objects with (one or two pointers, a string, an
 // interface). So every integer of at least the size of a pointer that a load
 // or an atomic operation produces may be one, also as a field of an
-// aggregate, unless the load is marked as one of a value of a Go type without
-// pointers (see MarkNoPointerLoads). What a call returns is not: the result
-// types of functions are those of the Go source, which LLVM does not change
-// at the levels TinyGo optimizes at (argument promotion runs only at O3).
-// Whatever an address is computed from is a pointer for sure, whatever its
-// type and wherever it comes from. And whatever is computed from a value that
-// may have a pointer in it, through any calculation, may have its bits too.
+// aggregate, unless the compiler marked the load as one of a Go value made of
+// integers, floats and booleans (llvmutil.NoPointerMDName; not a uintptr).
+// The compiler marks its own loads only, never C code's, and LLVM keeps
+// metadata it does not know only on a copy of the same load, which reads the
+// same Go value; it drops it from a load it changes or merges with another.
+// What a call returns is not taken for a pointer: the result types of
+// functions are those of the Go source, which LLVM does not change at the
+// levels TinyGo optimizes at (argument promotion runs only at O3). Whatever an
+// address is computed from is a pointer for sure, whatever its type and
+// wherever it comes from. And whatever is computed from a value that may have
+// a pointer in it, through any calculation, may have its bits too.
+//
+// A piece of a pointer narrower than a pointer cannot be held in a slot: the
+// collector reads whole words. Go takes the bits of a pointer apart only as
+// a uintptr, which keeps nothing alive, so LLVM has no reason to make such
+// pieces of a pointer that is still in use.
 func (f *gcSlotFunc) findCarriers() {
 	n := int32(len(f.insts))
 	sure := make([]bool, n)
@@ -814,15 +832,62 @@ func (f *gcSlotFunc) isCyclicPhi(i int32) bool {
 }
 
 // passesThrough returns whether the search for what a pointer in use is made
-// of goes on past user, which has a slot: past a conversion to a pointer and
-// past a phi in a loop. Their value may point past the end of the object it
-// was computed from (a pointer that runs one element ahead, an address
-// computed in integers), and then only the slot of what it was computed from
-// keeps the object. So the search goes on as for a value that is chosen into
-// the slot (see keepsValue), and what an address is computed from on the way
-// is needed itself.
+// of goes on past user, which has a slot: past any such value that a load or
+// a call did not make (a conversion to a pointer, a phi, a select). Its value
+// may point past the end of the object it was computed from (a pointer that
+// steps past the end of an array, an address computed in integers), and then
+// only the slot of what it was computed from keeps the object. So the search
+// goes on as for a value that is chosen into the slot (see keepsValue), and
+// what an address is computed from on the way is needed itself. A phi in
+// a loop that steps through an object needs what it starts from as well, see
+// selfDerived.
 func (f *gcSlotFunc) passesThrough(user int32) bool {
-	return f.opcode[user] == llvm.IntToPtr || f.isCyclicPhi(user)
+	return f.kind[user] == slotFlow
+}
+
+// selfDerived returns whether a phi in a loop is computed from its own value
+// with an address computed on the way: a pointer that steps through an
+// object. Its value can then point past the end of the object it started in,
+// where its slot no longer keeps that object, so the values it starts from
+// need slots of their own, even those that a load or a call made.
+func (f *gcSlotFunc) selfDerived(phi int32) bool {
+	if result, ok := f.derivedPhis[phi]; ok {
+		return result
+	}
+	type item struct {
+		value   int32
+		derived bool // an address was computed on the way
+	}
+	seen := map[item]struct{}{}
+	var stack []item
+	push := func(user int32, derived bool) {
+		for slot := f.opStart[user]; slot < f.opStart[user+1]; slot++ {
+			if operand := f.ops[slot]; operand >= 0 && f.bitsFlow(slot) {
+				it := item{operand, derived}
+				if _, ok := seen[it]; !ok {
+					seen[it] = struct{}{}
+					stack = append(stack, it)
+				}
+			}
+		}
+	}
+	push(phi, false)
+	result := false
+	for len(stack) != 0 && !result {
+		it := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		switch {
+		case it.value == phi:
+			result = it.derived
+		case f.kind[it.value] == slotFlow:
+			push(it.value, it.derived || !f.keepsValue(it.value))
+		}
+	}
+	if f.derivedPhis == nil {
+		f.derivedPhis = map[int32]bool{}
+	}
+	f.derivedPhis[phi] = result
+	return result
 }
 
 // keepsValue returns whether the instruction passes a value on without
@@ -1071,12 +1136,13 @@ func (f *gcSlotFunc) source(ptr llvm.Value) (def, agg int32, path []uint32) {
 	}
 }
 
-// carrierPaths appends the index path of every integer in a value of type typ
-// that has room for a pointer.
+// carrierPaths appends the index path of every field in a value of type typ
+// that is not a pointer but has room for one: an integer, or a float or
+// a vector whose bits an address may be computed from.
 func (f *gcSlotFunc) carrierPaths(typ llvm.Type, prefix []uint32, paths [][]uint32) [][]uint32 {
 	switch typ.TypeKind() {
-	case llvm.IntegerTypeKind:
-		if f.canCarry(typ) {
+	case llvm.IntegerTypeKind, llvm.FloatTypeKind, llvm.DoubleTypeKind, llvm.VectorTypeKind:
+		if f.wholeSlot(typ) {
 			paths = append(paths, append([]uint32(nil), prefix...))
 		}
 	case llvm.StructTypeKind:
@@ -1084,7 +1150,7 @@ func (f *gcSlotFunc) carrierPaths(typ llvm.Type, prefix []uint32, paths [][]uint
 			paths = f.carrierPaths(field, append(prefix, uint32(i)), paths)
 		}
 	case llvm.ArrayTypeKind:
-		if f.canCarry(typ.ElementType()) {
+		if elem := typ.ElementType(); f.canCarry(elem) || f.wholeSlot(elem) {
 			for i := 0; i < typ.ArrayLength(); i++ {
 				paths = f.carrierPaths(typ.ElementType(), append(prefix, uint32(i)), paths)
 			}
@@ -1279,7 +1345,9 @@ func (f *gcSlotFunc) liveSlots(tracked []llvm.Value) []llvm.Value {
 				// The slot of user roots what is used through it.
 				continue
 			}
-			asChosen = true
+			// The slot of user holds what goes into it unchanged, unless it
+			// steps through an object.
+			asChosen = !(f.isCyclicPhi(user) && f.selfDerived(user))
 		}
 		for slot := f.opStart[user]; slot < f.opStart[user+1]; slot++ {
 			operand := f.ops[slot]

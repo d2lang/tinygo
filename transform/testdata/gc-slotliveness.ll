@@ -595,6 +595,101 @@ end:
   ret i32 %v
 }
 
+; A pointer that steps through an object from its start can point past its
+; end at a collection, where the slot of the phi no longer keeps the object:
+; the allocation it starts from needs a slot of its own.
+define i32 @pointerStepsFromStart() {
+entry:
+  %base = call ptr @runtime.alloc(i32 16, ptr null)
+  br label %loop
+
+loop:
+  %q = phi ptr [ %base, %entry ], [ %next, %loop ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop ]
+  call void @collect()
+  %behind = getelementptr i8, ptr %q, i32 -12
+  %v = load i32, ptr %behind
+  %next = getelementptr i8, ptr %q, i32 4
+  %i.next = add i32 %i, 1
+  %done = icmp eq i32 %i.next, 8
+  br i1 %done, label %end, label %loop
+
+end:
+  ret i32 %v
+}
+
+; The same with the address stepped as an integer that a load made.
+define i32 @integerStepsFromLoad(ptr %from) {
+entry:
+  %x = load i32, ptr %from
+  br label %loop
+
+loop:
+  %ip = phi i32 [ %x, %entry ], [ %ip.next, %loop ]
+  call void @collect()
+  %addr = add i32 %ip, -4
+  %p = inttoptr i32 %addr to ptr
+  %v = load i32, ptr %p
+  %ip.next = add i32 %ip, 4
+  %done = icmp eq i32 %v, 0
+  br i1 %done, label %end, label %loop
+
+end:
+  ret i32 %v
+}
+
+; A tracked value outside a loop can hold the address just past the end of
+; an object, too: what it is computed from needs a slot.
+define i32 @trackedEnd(i1 %c, ptr %other) {
+  %base = call ptr @runtime.alloc(i32 16, ptr null)
+  %end = getelementptr i8, ptr %base, i32 16
+  %p = select i1 %c, ptr %end, ptr %other
+  call void @runtime.trackPointer(ptr %p)
+  call void @collect()
+  %last = getelementptr i8, ptr %p, i32 -4
+  %v = load i32, ptr %last
+  ret i32 %v
+}
+
+declare { i32, double } @makePair()
+
+; An address computed from a field that is not an integer: the field is kept
+; as it is.
+define i32 @doubleFieldAddress(ptr %from) {
+  %pair = load { i32, double }, ptr %from
+  call void @collect()
+  %d = extractvalue { i32, double } %pair, 1
+  %bits = bitcast double %d to i64
+  %low = trunc i64 %bits to i32
+  %p = inttoptr i32 %low to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+; The bits of a pointer of 32 bits survive a double: an address computed after
+; such a round trip comes from the load before it.
+define i32 @floatRoundTrip(ptr %from) {
+  %n = load i32, ptr %from
+  %d = uitofp i32 %n to double
+  call void @collect()
+  %m = fptoui double %d to i32
+  %p = inttoptr i32 %m to ptr
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+declare <2 x ptr> @twoPointers()
+
+; Where the pass cannot follow what happens (a vector here) it keeps what
+; a call returns as well, a vector of pointers included.
+define i32 @vectorResult() {
+  %pair = call <2 x ptr> @twoPointers()
+  call void @collect()
+  %p = extractelement <2 x ptr> %pair, i32 0
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
 ; A phi that only chooses among the pointers that loads made holds the one
 ; in use: the loads need no slots of their own.
 define void @listWalk(ptr %head) {

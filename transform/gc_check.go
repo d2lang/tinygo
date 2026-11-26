@@ -20,8 +20,11 @@ var GCSlotCheck func(function, value, usedBy string)
 // passed to a collecting call needs its slot during the call.
 //
 // liveSlots decides the other way round, forward from what is in use at
-// a collecting call. The check shares only the classification of the values
-// with it (hasPointer, intBits), not the search.
+// a collecting call. The check does not share that search, but it shares the
+// model the pass works in: which values may hold a pointer (hasPointer,
+// intBits), which values a slot holds unchanged (keepsValue, passesThrough,
+// selfDerived), what fits in a slot (wholeSlot), and that a function the pass
+// cannot follow keeps everything. A mistake in the model is not found here.
 func (f *gcSlotFunc) checkSlots(live []llvm.Value) {
 	n := int32(len(f.insts))
 	if n == 0 {
@@ -122,13 +125,11 @@ func (f *gcSlotFunc) checkSlots(live []llvm.Value) {
 			return
 		}
 		switch {
-		case held && f.passesThrough(value):
-			// Its slot holds what goes into it unchanged.
-			chosen = true
 		case held:
-			// The slot holds the value from here on, and so what it is made
-			// of. Only the way here is left.
-			crossed, chosen = false, false
+			// Its slot holds what goes into it unchanged, unless it is
+			// a phi in a loop that steps through an object (see
+			// passesThrough).
+			chosen = !(f.isCyclicPhi(value) && f.selfDerived(value))
 		case chosen && !f.keepsValue(value):
 			// An address is computed on the way to the slot: what it is
 			// computed from has to be held.
